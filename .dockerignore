@@ -1,0 +1,11 @@
+# Keep the build context small; install resolves deps from pyproject.
+.venv/
+venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+.git/
+.gitignore
+tests/
+docs/
+*.md

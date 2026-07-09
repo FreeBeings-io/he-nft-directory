@@ -1,0 +1,401 @@
+"""Cache population: the only place that reads Hive Engine's own current
+state and writes it into our tables. Nothing here derives anything from a
+transaction log -- every write is "this is what HE just told us," full
+stop. The design choices below are all backed by live measurement against
+mainnet HE nodes.
+
+refresh_account() is the one real hot path: there is no single HE query
+for "everything account X holds" (verified live -- the nft contract has
+one `{symbol}instances` table per collection, ~150 of them, no shared
+index like tokens' `balances`), so a refresh checks every known symbol.
+Each check is an indexed, per-account `find()` -- fast regardless of
+collection size (confirmed live: ~0.2-0.6s even against STAR's 27M+ rows)
+-- unlike bare pagination through a whole collection, which scales with
+collection size and is why this design never does that.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import contextlib
+import json
+import logging
+from datetime import datetime, timezone
+
+import psycopg
+from psycopg.types.json import Jsonb
+
+from . import config
+from .henodes import HENodes
+
+logger = logging.getLogger(__name__)
+
+
+def _epoch_ms_to_ts(value) -> datetime | None:
+    """HE's sellBook `timestamp` is milliseconds since epoch (verified
+    live), not a timestamptz-compatible value on its own."""
+    if value is None:
+        return None
+    return datetime.fromtimestamp(value / 1000, tz=timezone.utc)
+
+
+def _parse(value, default):
+    if isinstance(value, str):
+        try:
+            return json.loads(value) if value else default
+        except ValueError:
+            return default
+    return value if value is not None else default
+
+
+# -- collection catalog -------------------------------------------------------
+
+_CATALOG_UPSERT = (
+    "INSERT INTO collections (symbol, name, org_name, product_name, "
+    "issuer, url, metadata, group_by, properties, delegation_enabled, "
+    "market_enabled, supply, circulating_supply, max_supply, "
+    "undelegation_cooldown_days, refreshed_at) "
+    "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, now()) "
+    "ON CONFLICT (symbol) DO UPDATE SET "
+    "name = EXCLUDED.name, org_name = EXCLUDED.org_name, "
+    "product_name = EXCLUDED.product_name, issuer = EXCLUDED.issuer, "
+    "url = EXCLUDED.url, metadata = EXCLUDED.metadata, "
+    "group_by = EXCLUDED.group_by, properties = EXCLUDED.properties, "
+    "delegation_enabled = EXCLUDED.delegation_enabled, "
+    "market_enabled = EXCLUDED.market_enabled, "
+    "supply = EXCLUDED.supply, "
+    "circulating_supply = EXCLUDED.circulating_supply, "
+    "max_supply = EXCLUDED.max_supply, "
+    "undelegation_cooldown_days = EXCLUDED.undelegation_cooldown_days, "
+    "refreshed_at = now()"
+)
+
+
+def _catalog_row(row: dict) -> tuple:
+    metadata = _parse(row.get("metadata"), {})
+    return (
+        row["symbol"], row.get("name"), row.get("orgName"),
+        row.get("productName"), row.get("issuer"), metadata.get("url"),
+        Jsonb(metadata), Jsonb(_parse(row.get("groupBy"), [])),
+        Jsonb(_parse(row.get("properties"), {})),
+        bool(row.get("delegationEnabled")), bool(row.get("marketEnabled")),
+        row.get("supply"), row.get("circulatingSupply"),
+        row.get("maxSupply") or None, row.get("undelegationCooldown"),
+    )
+
+
+async def refresh_catalog(conn: psycopg.AsyncConnection, nodes: HENodes) -> int:
+    """Full mirror of HE's `nft`/`nfts` table -- ~150 rows platform-wide,
+    cheap to refresh in full every time (no per-symbol targeting needed;
+    this is the one table small enough that eager beats lazy)."""
+    offset, total = 0, 0
+    while True:
+        page = await nodes.find("nft", "nfts", {}, limit=1000, offset=offset)
+        if not page:
+            break
+        async with conn.cursor() as cur:
+            await cur.executemany(_CATALOG_UPSERT, [_catalog_row(row) for row in page])
+        total += len(page)
+        if len(page) < 1000:
+            break
+        offset += 1000
+    await conn.commit()
+    return total
+
+
+async def known_symbols(conn: psycopg.AsyncConnection) -> list[str]:
+    rows = await (await conn.execute("SELECT symbol FROM collections")).fetchall()
+    return [r["symbol"] for r in rows]
+
+
+# -- account refresh (the cache's read-through path) -------------------------
+
+def _instance_row(symbol: str, rec: dict) -> tuple:
+    # HE returns `delegatedTo` as an OBJECT ({"account": ..., "ownedBy": ...}),
+    # not a string -- found live: passing that dict straight into the text
+    # `delegated_to` column raised "cannot adapt type 'dict'" and crashed the
+    # entire refresh for any account holding a delegated NFT (one bad row
+    # fails the whole executemany batch). Pull the account/type out of the
+    # object; tolerate a plain-string shape too, just in case a node differs.
+    deleg = rec.get("delegatedTo")
+    if isinstance(deleg, dict):
+        delegated_to, delegated_to_type = deleg.get("account"), deleg.get("ownedBy")
+    else:
+        delegated_to, delegated_to_type = deleg, rec.get("delegatedToType")
+    return (
+        symbol, rec["_id"], rec["account"], rec.get("ownedBy", "u"),
+        delegated_to, delegated_to_type,
+        bool(rec.get("soulbound") or rec.get("soulBound")),
+        Jsonb(_parse(rec.get("properties"), {})),
+    )
+
+
+async def _fetch_symbol_for_account(
+    nodes: HENodes, symbol: str, account: str
+) -> list[dict] | None:
+    """None means "couldn't check" (transient HE failure), NOT "confirmed
+    empty" -- found live: treating them the same silently erased a real
+    account's real holdings (448 real STAR instances) from the cache the
+    moment that one symbol's lookup failed under cold-fetch burst load.
+
+    No extra retry here -- HENodes.call() already retries internally
+    (config.HE_RETRY_ROUNDS rounds with exponential backoff). Found live:
+    wrapping that in a second retry loop doesn't help when the underlying
+    condition is sustained node contention, not a one-off blip -- it just
+    doubles how long the failure (and the cooldown it triggers on other
+    concurrent lookups) lasts. Being retried at all is what None protects
+    against here: this symbol just gets picked up by a later refresh."""
+    try:
+        return await nodes.find(
+            "nft", f"{symbol}instances", {"account": account}, limit=1000,
+        )
+    except Exception as exc:
+        logger.warning("refresh: %s/%s failed: %r", account, symbol, exc)
+        return None
+
+
+async def refresh_account(
+    conn: psycopg.AsyncConnection, nodes: HENodes, account: str,
+    symbols: list[str],
+) -> int:
+    """Authoritative re-fetch of one account's current holdings across every
+    known symbol. Used both for the first-ever (cold) lookup and for
+    routine re-fetches -- there is no separate "cold-fetch" code path, only
+    this, called synchronously on a cache miss or asynchronously from the
+    refresh queue.
+
+    Only replaces rows for symbols that were actually confirmed this pass
+    (fetch succeeded, even if the confirmed result was empty) -- a symbol
+    whose lookup failed keeps whatever was cached before (or stays absent,
+    on a first-ever fetch) rather than being wiped to "owns nothing" on a
+    transient HE hiccup."""
+    if not symbols:
+        # The catalog hasn't been populated yet (a narrow window right
+        # after a fresh deploy, before the first catalog refresh
+        # completes) -- do NOT mark this account as known/refreshed with
+        # zero symbols actually checked, or it would look permanently
+        # "confirmed empty" to callers even though nothing was verified.
+        # Leave it exactly as it was; a later refresh (queued or cold-
+        # fetched again) picks it up once the catalog exists.
+        logger.warning(
+            "refresh_account(%s): no known symbols yet -- catalog not "
+            "populated, skipping", account,
+        )
+        return 0
+    results = await asyncio.gather(
+        *(_fetch_symbol_for_account(nodes, symbol, account) for symbol in symbols)
+    )
+    confirmed_symbols = [s for s, r in zip(symbols, results) if r is not None]
+    rows = [
+        _instance_row(symbol, rec)
+        for symbol, page in zip(symbols, results)
+        if page is not None
+        for rec in page
+    ]
+    failed = len(symbols) - len(confirmed_symbols)
+    if failed:
+        logger.warning(
+            "refresh: %s: %d/%d symbol(s) could not be confirmed this pass",
+            account, failed, len(symbols),
+        )
+    if confirmed_symbols:
+        await conn.execute(
+            "DELETE FROM instances WHERE account = %s AND symbol = ANY(%s)",
+            (account, confirmed_symbols),
+        )
+    if rows:
+        # ON CONFLICT, not a plain INSERT -- found live (crashed the whole
+        # sync service): the primary key is (symbol, nft_id), not including
+        # account, because an instance has exactly one owner. The DELETE
+        # above only clears *this* account's stale rows; if the instance
+        # was transferred here from an account we haven't refreshed yet,
+        # its stale row (still crediting the old owner) is still present
+        # under the same (symbol, nft_id) key and collides on a plain
+        # INSERT. The old owner's own next refresh naturally stops
+        # re-inserting it once HE confirms they no longer hold it.
+        async with conn.cursor() as cur:
+            await cur.executemany(
+                "INSERT INTO instances (symbol, nft_id, account, owned_by, "
+                "delegated_to, delegated_to_type, soul_bound, properties) "
+                "VALUES (%s, %s, %s, %s, %s, %s, %s, %s) "
+                "ON CONFLICT (symbol, nft_id) DO UPDATE SET "
+                "account = EXCLUDED.account, owned_by = EXCLUDED.owned_by, "
+                "delegated_to = EXCLUDED.delegated_to, "
+                "delegated_to_type = EXCLUDED.delegated_to_type, "
+                "soul_bound = EXCLUDED.soul_bound, "
+                "properties = EXCLUDED.properties, refreshed_at = now()",
+                rows,
+            )
+    await conn.execute(
+        "INSERT INTO known_accounts (account) VALUES (%s) "
+        "ON CONFLICT (account) DO UPDATE SET refreshed_at = now()",
+        (account,),
+    )
+    await conn.execute("DELETE FROM refresh_queue WHERE account = %s", (account,))
+    await conn.commit()
+    return len(rows)
+
+
+async def refresh_worker(
+    conn: psycopg.AsyncConnection, nodes: HENodes, stop: asyncio.Event,
+) -> None:
+    """Drains refresh_queue -- accounts the block-watcher flagged as
+    touched. Idles briefly when empty rather than polling tightly.
+
+    The whole iteration is guarded -- found live that only the
+    refresh_account() call itself was wrapped, so a failure in the plain
+    SELECT above it (or in known_symbols()) would have been unhandled and
+    crashed the service, the same class of bug the missing rollback here
+    already caused once."""
+    symbols = await known_symbols(conn)
+    row = None
+    while not stop.is_set():
+        try:
+            row = await (await conn.execute(
+                "SELECT account FROM refresh_queue ORDER BY queued_at LIMIT 1"
+            )).fetchone()
+            if row is None:
+                # Refresh the symbol list while idle, not on every single
+                # queued account -- the catalog rarely changes, so paying
+                # for this query once per busy-queue item is pure overhead.
+                symbols = await known_symbols(conn)
+                with contextlib.suppress(asyncio.TimeoutError):
+                    await asyncio.wait_for(stop.wait(), timeout=config.REFRESH_IDLE_SECONDS)
+                continue
+            await refresh_account(conn, nodes, row["account"], symbols)
+        except Exception as exc:
+            logger.error(
+                "refresh_worker: %s failed: %r",
+                row["account"] if row else "<select failed>", exc,
+            )
+            # A failed statement poisons the connection until rolled back --
+            # found live (crashed the whole service): without this, the
+            # cleanup below raises InFailedSqlTransaction, an unhandled
+            # exception distinct from the one this except block caught.
+            await conn.rollback()
+            if row is not None:
+                # avoid a permanently stuck head-of-queue entry on repeated failure
+                await conn.execute(
+                    "DELETE FROM refresh_queue WHERE account = %s", (row["account"],)
+                )
+                await conn.commit()
+
+
+async def safety_net_sweep(
+    conn: psycopg.AsyncConnection, nodes: HENodes,
+) -> int:
+    """Slow, periodic re-touch of every known account, oldest-refreshed
+    first -- not the primary freshness mechanism (the block-watcher +
+    refresh queue is), just insurance against a missed/misparsed block.
+    Bounded per call so it never blocks other work indefinitely. One
+    account's failure must not abort the rest of the batch (or poison the
+    connection for the next sweep) -- see refresh_worker's own rollback
+    for why."""
+    symbols = await known_symbols(conn)
+    rows = await (await conn.execute(
+        "SELECT account FROM known_accounts ORDER BY refreshed_at "
+        "LIMIT %s", (config.SAFETY_NET_BATCH_SIZE,),
+    )).fetchall()
+    for row in rows:
+        try:
+            await refresh_account(conn, nodes, row["account"], symbols)
+        except Exception as exc:
+            logger.error("safety-net: %s failed: %r", row["account"], exc)
+            await conn.rollback()
+    return len(rows)
+
+
+# -- market -------------------------------------------------------------------
+
+async def refresh_market(
+    conn: psycopg.AsyncConnection, nodes: HENodes, symbol: str,
+) -> int:
+    """Full mirror of one symbol's open sell orders -- small relative to
+    total supply even for huge collections (most instances aren't listed
+    for sale at any given time), so unlike instances this is refreshed in
+    full per symbol, not lazily per account."""
+    orders = []
+    offset = 0
+    for _ in range(config.MARKET_MAX_PAGES):
+        try:
+            page = await nodes.find(
+                "nftmarket", f"{symbol}sellBook", {}, limit=1000, offset=offset,
+            )
+        except Exception as exc:
+            # HE caps `offset` (~10k, verified live: it 400s beyond that), so a
+            # sellBook larger than the cap simply cannot be fully paginated.
+            # Stop and use the orders gathered so far -- a best-effort floor
+            # from a partial book beats abandoning the symbol entirely (which
+            # is what letting this propagate did: the whole symbol got rolled
+            # back and showed no market data at all). Floor is exact for any
+            # book within the cap -- the large majority -- and approximate only
+            # for the handful of mega-collections above it.
+            logger.warning(
+                "refresh_market(%s): pagination stopped at offset %d: %r",
+                symbol, offset, exc,
+            )
+            break
+        if not page:
+            break
+        orders.extend(page)
+        if len(page) < 1000:
+            break
+        offset += 1000
+    await conn.execute("DELETE FROM market_orders WHERE symbol = %s", (symbol,))
+    if orders:
+        async with conn.cursor() as cur:
+            await cur.executemany(
+                "INSERT INTO market_orders (symbol, nft_id, account, owned_by, "
+                "price, price_symbol, fee, ts, grouping) "
+                "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s) "
+                "ON CONFLICT (symbol, nft_id) DO NOTHING",
+                [
+                    (symbol, o["nftId"], o["account"], o.get("ownedBy", "u"),
+                     o["price"], o["priceSymbol"], o.get("fee"),
+                     _epoch_ms_to_ts(o.get("timestamp")),
+                     Jsonb(o.get("grouping") or {}))
+                    for o in orders
+                ],
+            )
+    await conn.execute("DELETE FROM market_rollups WHERE symbol = %s", (symbol,))
+    # Floor per (payment token, group). For an ungrouped collection every
+    # order's grouping is {}, so this collapses to one row per token -- the
+    # plain symbol-wide floor -- with no special-casing.
+    await conn.execute(
+        "INSERT INTO market_rollups "
+        "(symbol, price_symbol, grouping, grouping_key, floor_price, open_orders) "
+        "SELECT symbol, price_symbol, grouping, grouping::text, min(price), count(*) "
+        "FROM market_orders WHERE symbol = %s "
+        "GROUP BY symbol, price_symbol, grouping",
+        (symbol,),
+    )
+    # HE's `nft` catalog has no market flag (verified: the collection row
+    # simply doesn't carry one), so market-enablement is derived here from
+    # whether the symbol actually has an open sellBook.
+    await conn.execute(
+        "UPDATE collections SET market_enabled = %s WHERE symbol = %s",
+        (bool(orders), symbol),
+    )
+    await conn.commit()
+    return len(orders)
+
+
+async def refresh_all_markets(conn: psycopg.AsyncConnection, nodes: HENodes) -> None:
+    # Scope to symbols someone has actually queried (same lazy-cache
+    # principle as instances): a symbol shows up here once it's in the cache,
+    # not eagerly for all ~150 catalog entries. NOT gated on
+    # collections.market_enabled -- that flag is derived *by* this loop, so
+    # gating on it would be circular and (on a fresh DB) always empty, which
+    # is exactly the bug that left every market table empty.
+    rows = await (await conn.execute(
+        "SELECT DISTINCT symbol FROM instances ORDER BY symbol"
+    )).fetchall()
+    for row in rows:
+        try:
+            await refresh_market(conn, nodes, row["symbol"])
+        except Exception as exc:
+            logger.warning("refresh_market(%s) failed: %r", row["symbol"], exc)
+            # see refresh_worker's own rollback -- a failed statement
+            # poisons this connection for every symbol still left in this
+            # loop (and the next scheduled run) until rolled back
+            await conn.rollback()

@@ -1,0 +1,31 @@
+[project]
+name = "he-nft-directory"
+version = "0.1.0"
+description = "Hive Engine NFT Directory: a read-through cache over HE's own current state, for wallets and dApps"
+readme = "README.md"
+license = "MIT"
+requires-python = ">=3.11"
+dependencies = [
+    "httpx>=0.27",
+    "psycopg[binary]>=3.2",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=8", "pytest-asyncio>=0.23"]
+server = ["gunicorn>=22.0"]
+
+[project.urls]
+Repository = "https://github.com/FreeBeings-io/he-nft-directory"
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+henftdir = ["schema.sql"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"

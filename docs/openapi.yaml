@@ -1,0 +1,475 @@
+openapi: 3.0.3
+info:
+  title: Hive Engine NFT Directory API
+  version: 0.2.0-draft
+  description: |
+    Public, read-only HTTP API serving Hive Engine NFT balances, collection
+    metadata, and market state — a read-through cache over Hive Engine's own
+    current state, not a historical ledger. An account is populated the first
+    time it's queried and kept current by a background block-watcher from
+    then on; there is no transaction-history endpoint.
+
+    **Draft status.** This document mirrors `src/henftdir/api.py`. Response
+    shapes are pre-release drafts and may change before v1 locks.
+
+    **Access.** Anonymous, no API key (may change before v1). All
+    responses carry `Access-Control-Allow-Origin: *`, so browser clients can
+    call this API directly with no proxy.
+
+    **Data scope & disclosure.** This service stores and serves public
+    blockchain data. Unlike the earlier full-history design, holdings here
+    reflect the last refresh, not a permanent append-only record — see
+    `/status.disclosure`.
+
+    **Pagination.** List endpoints are cursor-paginated: pass the previous
+    response's `next_cursor` (or `next_cursor_symbol`) back as `?cursor=` /
+    `?cursor_symbol=`. `next_cursor` is `null` once a page comes back shorter
+    than `limit` — that's the only end-of-list signal, there is no total
+    count.
+  license:
+    name: MIT
+    url: https://github.com/FreeBeings-io/he-nft-directory/blob/main/LICENSE
+externalDocs:
+  description: Repository
+  url: https://github.com/FreeBeings-io/he-nft-directory
+servers:
+  - url: https://TBD.example
+    description: >-
+      Production — domain not yet decided. Placeholder only.
+  - url: http://localhost:8080
+    description: Local dev — `gunicorn -w 4 'henftdir.api:application'`
+tags:
+  - name: Accounts
+    description: Per-account NFT balances (populated on first query).
+  - name: Collections
+    description: Directory browse — one row per NFT symbol.
+  - name: NFTs
+    description: Single-instance detail.
+  - name: Market
+    description: Open sell orders and price rollups.
+  - name: Status
+    description: Trust surface — cache freshness and mapping coverage.
+
+paths:
+  /accounts/{account}/nfts:
+    get:
+      operationId: getAccountNfts
+      tags: [Accounts]
+      summary: Wallet display — owned, delegated-in, and listed NFTs
+      description: >-
+        Owned + delegated-in NFTs, plus NFTs the account has listed on the
+        market (held in escrow by the `nftmarket` contract, so they would
+        otherwise disappear from a naive owner query). All three groups are
+        keyed by symbol. If this account has never been queried before, it is
+        populated synchronously from Hive Engine first — expect a few
+        seconds' latency on that first call only; every later call is served
+        from the cache.
+      parameters:
+        - $ref: '#/components/parameters/AccountPath'
+        - $ref: '#/components/parameters/SymbolFilter'
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  account: { type: string }
+                  owned: { $ref: '#/components/schemas/AccountNftGroups' }
+                  delegated_in: { $ref: '#/components/schemas/AccountNftGroups' }
+                  listed: { $ref: '#/components/schemas/AccountNftListedGroups' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '500': { $ref: '#/components/responses/ServerError' }
+
+  /collections:
+    get:
+      operationId: listCollections
+      tags: [Collections]
+      summary: Directory browse — all known NFT symbols
+      description: >-
+        A full mirror of Hive Engine's own NFT catalog, refreshed
+        periodically in full (unlike instances, which are cached per
+        account) — every symbol that exists on HE appears here regardless of
+        whether any of its instances have been queried yet.
+      parameters:
+        - name: cursor_symbol
+          in: query
+          description: >-
+            Pagination cursor: the last `symbol` seen on the previous page.
+            Symbols sort lexicographically, not by creation order.
+          schema: { type: string, default: '' }
+        - $ref: '#/components/parameters/Limit'
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  collections:
+                    type: array
+                    items: { $ref: '#/components/schemas/Collection' }
+                  next_cursor_symbol:
+                    type: string
+                    nullable: true
+        '500': { $ref: '#/components/responses/ServerError' }
+
+  /collections/{symbol}:
+    get:
+      operationId: getCollection
+      tags: [Collections]
+      summary: Collection detail
+      parameters:
+        - $ref: '#/components/parameters/SymbolPath'
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Collection' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '500': { $ref: '#/components/responses/ServerError' }
+
+  /nfts/{symbol}/{id}:
+    get:
+      operationId: getNft
+      tags: [NFTs]
+      summary: Single NFT detail
+      description: >-
+        Current instance state plus its normalized display object (if the
+        symbol has a display mapping) and any open market listing. If this
+        instance isn't already cached (its current holder has never been
+        queried), a single live point lookup resolves its current owner and
+        populates that account before responding.
+      parameters:
+        - $ref: '#/components/parameters/SymbolPath'
+        - $ref: '#/components/parameters/NftIdPath'
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/NftDetail' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '500': { $ref: '#/components/responses/ServerError' }
+
+  /market/{symbol}:
+    get:
+      operationId: getMarket
+      tags: [Market]
+      summary: Open orders and price rollups for a symbol
+      parameters:
+        - $ref: '#/components/parameters/SymbolPath'
+        - name: account
+          in: query
+          description: Filter open orders to one seller account.
+          schema: { type: string }
+        - $ref: '#/components/parameters/Cursor'
+        - $ref: '#/components/parameters/Limit'
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  symbol: { type: string }
+                  rollups:
+                    type: array
+                    items: { $ref: '#/components/schemas/MarketRollup' }
+                  open_orders:
+                    type: array
+                    items: { $ref: '#/components/schemas/MarketOrder' }
+                  last_sales:
+                    type: array
+                    items: { $ref: '#/components/schemas/MarketLastSale' }
+                  next_cursor: { $ref: '#/components/schemas/NextCursor' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '500': { $ref: '#/components/responses/ServerError' }
+
+  /status:
+    get:
+      operationId: getStatus
+      tags: [Status]
+      summary: Trust surface — cache freshness and mapping coverage
+      description: >-
+        Per-loop last-seen HE block (block_watcher; also written by the
+        catalog/market sweeps), how many accounts are cached, how deep the
+        refresh queue currently is, and display-mapping coverage. There is
+        no reconciliation metric in this design — the cache doesn't derive
+        state, it mirrors HE directly on every refresh, so "correct" just
+        means "not yet due for a refresh."
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Status' }
+        '500': { $ref: '#/components/responses/ServerError' }
+
+components:
+  parameters:
+    AccountPath:
+      name: account
+      in: path
+      required: true
+      description: Hive account name.
+      schema: { type: string, pattern: '^[a-z0-9.-]{3,16}$' }
+    SymbolPath:
+      name: symbol
+      in: path
+      required: true
+      description: Hive Engine NFT symbol.
+      schema: { type: string, pattern: '^[A-Z0-9]+$' }
+    NftIdPath:
+      name: id
+      in: path
+      required: true
+      description: NFT instance id, unique within its symbol.
+      schema: { type: integer }
+    SymbolFilter:
+      name: symbol
+      in: query
+      description: Restrict results to one NFT symbol.
+      schema: { type: string, pattern: '^[A-Z0-9]+$' }
+    Cursor:
+      name: cursor
+      in: query
+      description: Pagination cursor — the previous page's `next_cursor`. Omit for the first page.
+      schema: { type: integer, default: 0 }
+    Limit:
+      name: limit
+      in: query
+      description: Page size, capped server-side at 1000.
+      schema: { type: integer, default: 100, maximum: 1000 }
+
+  responses:
+    BadRequest:
+      description: >-
+        Bad Request — a path or query parameter failed to parse
+        (e.g. a non-numeric `id` or `cursor`).
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+    NotFound:
+      description: No resource matched the given path parameters.
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+    ServerError:
+      description: >-
+        Unhandled failure. Never includes a stack trace; check the deployment's
+        logs / `/status` for context.
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+
+  schemas:
+    Error:
+      type: object
+      properties:
+        error:
+          type: string
+          description: The HTTP status line, repeated in the body (e.g. `"404 Not Found"`).
+
+    NextCursor:
+      type: integer
+      nullable: true
+      description: Pass back as `?cursor=` for the next page; `null` means this was the last page.
+
+    DisplayObject:
+      type: object
+      nullable: true
+      description: >-
+        Normalized cross-collection view, or `null` if the
+        symbol has no display mapping yet. The API never blocks on mapping
+        coverage — see `/status.display_mapping_coverage`.
+      properties:
+        name: { type: string, nullable: true }
+        image: { type: string, nullable: true }
+        collection:
+          type: string
+          description: Collection display name, falling back to the symbol.
+        attributes:
+          type: object
+          additionalProperties: true
+          description: Subset of raw `properties` the mapping surfaces, keyed by the mapping's `attributes` list.
+
+    AccountNftItem:
+      type: object
+      properties:
+        nft_id: { type: integer }
+        account: { type: string }
+        owned_by:
+          type: string
+          description: '`u` (user-held) or `c` (contract-held, e.g. escrowed on the market).'
+        delegated_to: { type: string, nullable: true }
+        properties:
+          type: object
+          additionalProperties: true
+          description: Raw per-instance properties, collection-specific.
+        display: { $ref: '#/components/schemas/DisplayObject' }
+
+    AccountNftListedItem:
+      allOf:
+        - $ref: '#/components/schemas/AccountNftItem'
+        - type: object
+          properties:
+            price: { type: string, description: Decimal serialized as a string. }
+            price_symbol: { type: string }
+
+    AccountNftGroups:
+      type: object
+      description: Keyed by NFT symbol.
+      additionalProperties:
+        type: array
+        items: { $ref: '#/components/schemas/AccountNftItem' }
+
+    AccountNftListedGroups:
+      type: object
+      description: Keyed by NFT symbol.
+      additionalProperties:
+        type: array
+        items: { $ref: '#/components/schemas/AccountNftListedItem' }
+
+    Collection:
+      type: object
+      description: A direct mirror of one row from Hive Engine's own `nft`/`nfts` table.
+      properties:
+        symbol: { type: string }
+        name: { type: string, nullable: true }
+        org_name: { type: string, nullable: true }
+        product_name: { type: string, nullable: true }
+        issuer: { type: string, nullable: true }
+        url: { type: string, nullable: true }
+        metadata: { type: object, additionalProperties: true }
+        group_by: { type: array, items: { type: string } }
+        properties:
+          type: object
+          additionalProperties: true
+          description: HE's accumulated per-instance property schema for this symbol.
+        delegation_enabled: { type: boolean }
+        market_enabled:
+          type: boolean
+          description: >-
+            Derived — HE's catalog has no market flag, so this is set true
+            once the market refresh finds an open sellBook for the symbol.
+            May lag until the symbol's first market refresh.
+        supply:
+          type: integer
+          nullable: true
+          description: HE's own self-reported total issued, including later-burned.
+        circulating_supply:
+          type: integer
+          nullable: true
+          description: HE's own self-reported current live count.
+        burned:
+          type: integer
+          nullable: true
+          description: '`supply - circulating_supply`.'
+        max_supply: { type: integer, nullable: true }
+        undelegation_cooldown_days: { type: integer, nullable: true }
+        refreshed_at:
+          type: string
+          format: date-time
+          description: When this row was last mirrored from HE.
+        has_display_mapping: { type: boolean }
+
+    NftDetail:
+      type: object
+      properties:
+        symbol: { type: string }
+        nft_id: { type: integer }
+        account: { type: string }
+        owned_by: { type: string, description: '`u` or `c`.' }
+        delegated_to: { type: string, nullable: true }
+        delegated_to_type: { type: string, nullable: true }
+        soul_bound: { type: boolean }
+        properties: { type: object, additionalProperties: true }
+        refreshed_at:
+          type: string
+          format: date-time
+          description: When this instance was last mirrored from HE.
+        collection_name: { type: string, nullable: true }
+        display: { $ref: '#/components/schemas/DisplayObject' }
+        open_order:
+          nullable: true
+          allOf:
+            - type: object
+              properties:
+                price: { type: string }
+                price_symbol: { type: string }
+                account: { type: string }
+                ts: { type: string, format: date-time }
+
+    MarketOrder:
+      type: object
+      properties:
+        nft_id: { type: integer }
+        account: { type: string, description: Seller. }
+        owned_by: { type: string }
+        price: { type: string, description: Decimal serialized as a string. }
+        price_symbol: { type: string }
+        fee: { type: integer, nullable: true }
+        ts: { type: string, format: date-time, nullable: true }
+
+    MarketRollup:
+      type: object
+      description: >-
+        Floor price per payment token AND per group. HE sell orders carry a
+        `grouping` (e.g. rarity/type); one symbol often spans hundreds of
+        groups, so a symbol-wide floor is misleading — floor is rolled up per
+        group. An ungrouped collection yields a single `{}`-grouping row per
+        token, i.e. the plain symbol-wide floor.
+      properties:
+        price_symbol: { type: string }
+        grouping:
+          type: object
+          additionalProperties: true
+          description: The HE order grouping this floor is for; `{}` when the collection has no grouping.
+        floor_price: { type: string, nullable: true }
+        open_orders: { type: integer }
+
+    MarketLastSale:
+      type: object
+      description: >-
+        Last-sale price and trailing-30-day volume per payment token,
+        computed from `market_sales` — a forward-only trade log the
+        block-watcher captures from HE's own `hitSellOrder` events. Empty
+        until trades occur after the watcher's start point; there is no
+        pre-launch trade history to backfill (HE has no trade-history
+        endpoint). Prices stay in their payment token — no USD conversion.
+      properties:
+        price_symbol: { type: string }
+        last_price: { type: string, nullable: true, description: Decimal serialized as a string. }
+        last_ts: { type: string, format: date-time, nullable: true }
+        sales_30d: { type: integer, description: Number of sales in the trailing 30 days. }
+        volume_30d: { type: string, nullable: true, description: Summed sale price over the trailing 30 days, in `price_symbol`. }
+
+    Status:
+      type: object
+      properties:
+        sync:
+          type: object
+          description: Keyed by background loop name (currently `block_watcher`).
+          additionalProperties:
+            type: object
+            properties:
+              name: { type: string }
+              last_he_block: { type: integer, nullable: true }
+              updated_at: { type: string, format: date-time }
+        known_accounts:
+          type: integer
+          description: Total accounts populated in the cache so far.
+        refresh_queue_depth:
+          type: integer
+          description: Accounts flagged by the block-watcher, awaiting a refresh.
+        display_mapping_coverage:
+          type: object
+          properties:
+            mapped: { type: integer }
+            total: { type: integer }
+        disclosure: { type: string }
