@@ -47,6 +47,19 @@ All notable changes to **he-nft-directory** are recorded here. Format follows
 
 All found live during and after the first real deploy:
 
+- NFT activity happening inside OTHER contracts' transactions (pack
+  openings and any contract that issues/moves NFTs internally) was
+  invisible to the block-watcher: it gated on the transaction's own
+  contract, but those txs carry their nft-contract events in the logs
+  under a different top-level contract. Detection is now per emitted
+  event, which fixes both refresh queueing (previously only the hourly
+  safety-net caught those holders) and activity capture.
+- One newly-added rotation node was removed the same day: it serves the
+  `blockchain` endpoint fine but rate-limits `contracts` `find` queries
+  by policy (hundreds of 429s in hours, including aborted market-book
+  pagination). Rotation membership now requires both endpoints
+  unrestricted.
+
 - A never-before-seen account's first query does a synchronous ~150-table
   cold-fetch before responding; gunicorn's 30s default worker timeout
   killed that request mid-flight. Raised to 90s (`WEB_TIMEOUT`).

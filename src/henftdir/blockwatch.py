@@ -4,7 +4,9 @@ Walks HE blocks directly by number (no Hive L1 node needed -- HE's own
 `getBlockInfo` is a self-contained, O(1) point lookup carrying every
 transaction's contract/action/payload/logs inline; verified live across
 genesis-era through current blocks). For each
-transaction where `contract in {nft, nftmarket}`, it queues every account
+transaction that touches NFTs (targets nft/nftmarket directly, OR emits
+nft/nftmarket events from inside another contract -- pack openings etc.;
+see catalog.has_nft_activity), it queues every account
 plausibly touched (catalog.touched_accounts) for a refresh -- it never
 interprets *what* happened, only *who* to re-fetch. sync.py's refresh
 worker is what turns a queued account into current, correct state, by
@@ -101,7 +103,12 @@ def parse_block(block: dict) -> tuple[set[str], list[dict], list[dict]]:
     he_block = block.get("blockNumber")
     ts = _block_ts(block.get("timestamp"))
     for tx in block.get("transactions", []):
-        if catalog.is_nft_tx(tx.get("contract")):
+        # per-EVENT nft detection, not per-tx: other contracts (pack
+        # openings etc.) issue/move NFTs from inside their own txs, which a
+        # tx-contract gate silently drops -- both for activity capture and,
+        # worse, for refresh queueing (found in the activity-feed review;
+        # previously only the hourly safety-net caught those holders).
+        if catalog.has_nft_activity(tx):
             accounts |= catalog.touched_accounts(tx)
             sales.extend(catalog.market_sales(tx, he_block, ts))
             events.extend(catalog.nft_events(tx, he_block, ts))

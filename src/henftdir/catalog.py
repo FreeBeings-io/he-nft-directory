@@ -11,6 +11,25 @@ def is_nft_tx(contract: str) -> bool:
     return contract in ("nft", "nftmarket")
 
 
+def tx_events(tx: dict) -> list[dict]:
+    """A transaction's emitted events, parsed once (logs arrive as a dict or
+    a JSON string depending on the node)."""
+    logs = _load_json(tx.get("logs"), {})
+    return (logs or {}).get("events", []) or []
+
+
+def has_nft_activity(tx: dict) -> bool:
+    """True if this transaction touches NFTs at all — either it targets the
+    nft/nftmarket contract directly, or ANY OTHER contract's execution
+    emitted nft/nftmarket events (packmanager pack openings, and any future
+    contract that issues/moves NFTs internally, surface this way: the tx's
+    top-level contract is theirs, but the logs carry nft-contract events).
+    Gating on the tx-level contract alone silently drops that activity."""
+    if is_nft_tx(tx.get("contract")):
+        return True
+    return any(is_nft_tx(e.get("contract")) for e in tx_events(tx))
+
+
 def _load_json(value, default):
     """HE inlines logs/payload as either a dict or a JSON string."""
     if isinstance(value, str):
@@ -85,13 +104,13 @@ _EVENT_OPS = {
 
 
 def nft_events(tx: dict, he_block: int, ts) -> list[dict]:
-    """Activity-feed rows from one nft/nftmarket transaction's emitted
+    """Activity-feed rows from one transaction's emitted nft/nftmarket
     events (see _EVENT_OPS; `hitSellOrder` expands into one `market_buy`
-    per instance sold, mirroring market_sales()). Rows carry no tx_seq --
-    the caller assigns it per block, since idempotency is per (block, seq)."""
-    if not is_nft_tx(tx.get("contract")):
-        return []
-    logs = _load_json(tx.get("logs"), {})
+    per instance sold, mirroring market_sales()). Filters per EVENT
+    contract, not per tx contract -- pack openings and other contracts
+    issue NFTs from inside their own transactions (see has_nft_activity).
+    Rows carry no tx_seq -- the caller assigns it per block, since
+    idempotency is per (block, seq)."""
     tx_id = tx.get("transactionId")
     events: list[dict] = []
 
@@ -103,7 +122,9 @@ def nft_events(tx: dict, he_block: int, ts) -> list[dict]:
             "tx_id": tx_id, "he_block": he_block, "ts": ts,
         })
 
-    for event in (logs or {}).get("events", []):
+    for event in tx_events(tx):
+        if not is_nft_tx(event.get("contract")):
+            continue
         name = event.get("event")
         data = event.get("data") or {}
         if name == "hitSellOrder":

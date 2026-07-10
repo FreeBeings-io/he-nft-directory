@@ -60,6 +60,23 @@ def test_nft_events_ignores_admin_and_non_nft():
     assert catalog.nft_events(other, 100, TS) == []
 
 
+def test_nft_events_captured_from_other_contracts():
+    """Pack openings etc.: the tx targets another contract, but its logs
+    carry nft-contract events -- those must be captured (and only the
+    nft/nftmarket events, not the host contract's own)."""
+    t = tx("packmanager", "alice", action="open", events=[
+        {"contract": "packmanager", "event": "openPack",
+         "data": {"account": "alice", "symbol": "PACK", "id": "9"}},
+        {"contract": "nft", "event": "issue",
+         "data": {"from": "packmanager", "to": "alice", "symbol": "CARD", "id": "42"}},
+    ])
+    assert catalog.has_nft_activity(t)
+    events = catalog.nft_events(t, 100, TS)
+    assert [(e["op"], e["symbol"], e["nft_id"], e["counterparty"]) for e in events] == [
+        ("issue", "CARD", 42, "alice"),
+    ]
+
+
 def test_parse_block_assigns_sequential_tx_seq():
     block = {"blockNumber": 100, "timestamp": "2026-07-10T00:00:00",
              "transactions": [

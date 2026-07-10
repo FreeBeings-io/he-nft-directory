@@ -3,11 +3,17 @@
 # Public Hive Engine RPC nodes (health + cross-node consensus verified
 # 2026-07-10: identical block/database hashes at a settled block; the client
 # fails over down this list — membership is a starting list, not a guarantee).
+#
+# herpc.actifit.io was added and removed the same day: its `blockchain`
+# endpoint is fine (it passed the consensus probe), but its `contracts`
+# endpoint 429s `find` calls with "restricted by policy" — 422 failures in
+# a few hours of production rotation, every one of them from that node,
+# including aborted market-book pagination. A node must serve BOTH
+# endpoints unrestricted to belong in this rotation.
 HE_NODES = [
     "https://api.hive-engine.com/rpc",
     "https://api2.hive-engine.com/rpc",
     "https://herpc.dtools.dev",
-    "https://herpc.actifit.io",
     "https://enginerpc.com",
 ]
 
