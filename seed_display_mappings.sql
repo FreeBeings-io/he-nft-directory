@@ -1,9 +1,15 @@
 -- Display-mapping seed data for he-nft-directory (src/henftdir/display.py).
 --
--- Covers every collection with cached instances as of 2026-07-08 (69 of 78 --
--- the other 9 are excluded: on-chain properties are empty, broken/burned
--- test data, or clearly not real NFT metadata -- ABCDEFGHIJ, ZINGALPHA,
--- CIMB, SCOOTER, BHRIGA, DCROPSTEST, ICSOUL, DTEST, ACHVMNT).
+-- Coverage as of 2026-07-10: every collection in HE's full catalog (152)
+-- was audited with live on-chain property samples; 91 are mapped. The rest
+-- are deliberately excluded:
+--   - 37 have zero issued instances (nothing to display);
+--   - 10 have instances but empty properties;
+--   - test/junk data: ABCDEFGHIJ, ZINGALPHA (witness-sig plumbing),
+--     TEST, DTEST, TESTNFT, IDLETEST, DCROPSTEST, STT, ACHVMNT ("null"
+--     values), SCOOTER, CIMB;
+--   - properties the mapping engine cannot reach (JSON-encoded strings /
+--     CSV blobs): BHRIGA, ICSOUL, ZCOLISEUM, HEROAPI.
 --
 -- Built from real on-chain property samples plus live web research into
 -- each project's official site/docs/source for an image source (see
@@ -288,3 +294,47 @@ INSERT INTO display_mappings (symbol, version, mapping) VALUES
 -- public IPFS gateway could resolve in testing (5 gateways tried) --
 -- so this was deliberately NOT built as a speculative engine feature;
 -- image is omitted for the whole family rather than guessed.
+
+-- Display-mapping additions, researched 2026-07-10: every catalog collection
+-- (152 total) was sampled live from HE; these are the ones with real,
+-- engine-reachable properties that lacked a mapping. Per-instance images
+-- where the chain carries one; a static unit icon only where every instance
+-- is an identical unit (miner/land units).
+INSERT INTO display_mappings (symbol, version, mapping) VALUES
+-- dCITY API cards: game-state props (mostly JSON strings; reachable scalars only)
+('API', 1, '{"name": {"template": "dCITY API #{nft_id}"}, "attributes": ["gov", "background", "x"]}'),
+-- Crystal Miner: identical mining units; collection icon is the honest image
+('CECM', 1, '{"name": {"template": "Crystal Miner #{nft_id}"}, "image": {"template": "https://cdn-icons-png.flaticon.com/128/2736/2736404.png"}, "attributes": ["Miner"]}'),
+-- CONO registry: CARDBACK jpg URLs point at a dead host (dev1.cono.io, no
+-- DNS 2026-07-10) -- name only rather than guaranteed-broken images
+('CONONFT', 1, '{"name": {"template": "CONO Registry #{nft_id}"}}'),
+-- CivilizationsLands: identical land units with a level
+('CVZ', 1, '{"name": {"template": "CivilizationsLands #{nft_id}"}, "attributes": ["level"]}'),
+('DROPCRATE', 1, '{"name": {"template": "Airdrop PSYBER Crate #{nft_id}"}, "attributes": ["opened"]}'),
+('EMPIRE', 1, '{"name": {"from": "properties.name"}}'),
+('ENTRYSHOP', 1, '{"name": {"from": "properties.name"}, "attributes": ["status", "price"]}'),
+('HKPROJECT', 1, '{"name": {"from": "properties.PROP"}, "attributes": ["LVL", "VALID"]}'),
+('HKUWORKER', 1, '{"name": {"template": "HK University Worker #{nft_id}"}, "attributes": ["Experience", "Energy", "Bio"]}'),
+('HONNFT', 1, '{"name": {"from": "properties.cardname"}, "attributes": ["cardid", "cardmovemin", "cardmovemax", "cardtapmin", "cardtapmax"]}'),
+('IDLE', 1, '{"name": {"from": "properties.name"}}'),
+-- inji: cid is dag-cbor (metadata, not a direct image) -- name only, cid surfaced
+('INJI', 1, '{"name": {"template": "inji #{nft_id}"}, "attributes": ["cid"]}'),
+('MONKEY', 1, '{"name": {"template": "Guilty Monkey #{nft_id}"}, "attributes": ["Brewing", "Distribution", "Marketing"]}'),
+-- Monster Swap: attributes prop is a CSV string (unreachable); scalars only
+('MONSTER', 1, '{"name": {"template": "Monster #{nft_id}"}, "attributes": ["edition", "alive"]}'),
+-- PSYBER X character: the ipfs CIDs 504 on multiple gateways (content
+-- unpinned, checked 2026-07-10) -- no image; cid surfaced as an attribute
+('PSYCHAR', 1, '{"name": {"template": "PSYBER X Character #{nft_id}"}, "attributes": ["dbid", "ipfs"]}'),
+('PSYCRATE', 1, '{"name": {"template": "PSYBER Crate #{nft_id}"}, "attributes": ["opened"]}'),
+-- Quodlibet: dls1 ipfs URLs 504 on multiple gateways (content unpinned,
+-- checked 2026-07-10) -- name only
+('QLB', 1, '{"name": {"template": "Quodlibet #{nft_id}"}}'),
+-- rama nfts: image prop is scheme-less ("ipfs.io/ipfs/...")
+('RAMANFTS', 1, '{"name": {"from": "properties.name"}, "image": {"template": "https://{image}"}, "attributes": ["dna"]}'),
+('ROBO', 1, '{"name": {"template": "ROBO #{nft_id}"}, "attributes": ["gen"]}'),
+('TOW', 1, '{"name": {"from": "properties.name"}, "attributes": ["first", "second"]}'),
+('TRUSTEX', 1, '{"name": {"template": "Trust Exchange #{nft_id}"}, "attributes": ["series", "edition", "type", "foil"]}'),
+-- Vibes: each NFT is a live-music event
+('VIBES', 1, '{"name": {"from": "properties.EventName"}, "attributes": ["Date", "EventID"]}'),
+('WOOVOUCHER', 1, '{"name": {"template": "WOO Alpha Pack Voucher #{nft_id}"}, "attributes": ["Redemption"]}')
+ON CONFLICT (symbol, version) DO NOTHING;
