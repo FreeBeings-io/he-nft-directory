@@ -1,11 +1,14 @@
 """Static configuration defaults."""
 
-# Public Hive Engine RPC nodes (health observed 2026-07-03; the client fails
-# over down this list — membership is a starting list, not a guarantee).
+# Public Hive Engine RPC nodes (health + cross-node consensus verified
+# 2026-07-10: identical block/database hashes at a settled block; the client
+# fails over down this list — membership is a starting list, not a guarantee).
 HE_NODES = [
     "https://api.hive-engine.com/rpc",
     "https://api2.hive-engine.com/rpc",
     "https://herpc.dtools.dev",
+    "https://herpc.actifit.io",
+    "https://enginerpc.com",
 ]
 
 # Politeness toward public HE nodes: bounded concurrency, spacing between
