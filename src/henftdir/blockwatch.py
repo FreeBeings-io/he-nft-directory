@@ -70,21 +70,67 @@ async def record_sales(conn: psycopg.AsyncConnection, sales: list[dict]) -> None
         )
 
 
-async def process_block(conn: psycopg.AsyncConnection, block: dict) -> int:
-    """Queue every account touched by this block's nft/nftmarket txs, and
-    record any completed market trades. Returns the number of distinct
-    accounts queued."""
+async def record_events(conn: psycopg.AsyncConnection, events: list[dict]) -> None:
+    """Append activity-feed rows (rolling window; see schema nft_events).
+    tx_seq is assigned by the caller per block; the parse is deterministic,
+    so (he_block, tx_seq) makes block reprocessing idempotent."""
+    if not events:
+        return
+    async with conn.cursor() as cur:
+        await cur.executemany(
+            "INSERT INTO nft_events (he_block, tx_seq, symbol, nft_id, op, "
+            "account, counterparty, price, price_symbol, tx_id, ts) "
+            "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s) "
+            "ON CONFLICT (he_block, tx_seq) DO NOTHING",
+            [
+                (e["he_block"], e["tx_seq"], e["symbol"], e["nft_id"], e["op"],
+                 e["account"], e["counterparty"], e["price"],
+                 e["price_symbol"], e["tx_id"], e["ts"])
+                for e in events
+            ],
+        )
+
+
+def parse_block(block: dict) -> tuple[set[str], list[dict], list[dict]]:
+    """One deterministic pass over a block's nft/nftmarket txs:
+    (touched accounts, completed sales, activity events with tx_seq
+    assigned in encounter order)."""
     accounts: set[str] = set()
     sales: list[dict] = []
+    events: list[dict] = []
     he_block = block.get("blockNumber")
     ts = _block_ts(block.get("timestamp"))
     for tx in block.get("transactions", []):
         if catalog.is_nft_tx(tx.get("contract")):
             accounts |= catalog.touched_accounts(tx)
             sales.extend(catalog.market_sales(tx, he_block, ts))
+            events.extend(catalog.nft_events(tx, he_block, ts))
+    for seq, event in enumerate(events):
+        event["tx_seq"] = seq
+    return accounts, sales, events
+
+
+async def process_block(conn: psycopg.AsyncConnection, block: dict) -> int:
+    """Queue every account touched by this block's nft/nftmarket txs, and
+    record any completed market trades + activity events. Returns the
+    number of distinct accounts queued."""
+    accounts, sales, events = parse_block(block)
     await queue_refresh(conn, accounts)
     await record_sales(conn, sales)
+    await record_events(conn, events)
     return len(accounts)
+
+
+async def process_block_capture_only(conn: psycopg.AsyncConnection, block: dict) -> int:
+    """Backfill variant: record sales + events but queue NO refreshes --
+    old blocks say nothing about *current* holdings (the live path and
+    safety-net own freshness), and queueing weeks of historical accounts
+    would swamp the refresh worker for zero cache benefit. Returns the
+    number of events recorded."""
+    _, sales, events = parse_block(block)
+    await record_sales(conn, sales)
+    await record_events(conn, events)
+    return len(events)
 
 
 async def run(app_dsn: str, nodes: HENodes, stop: asyncio.Event) -> None:

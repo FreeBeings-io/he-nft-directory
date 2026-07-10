@@ -65,6 +65,79 @@ def touched_accounts(tx: dict) -> set[str]:
     return accounts
 
 
+# nft/nftmarket emitted-event names -> activity-feed op labels. Only events
+# that describe something a wallet user would recognize as "activity" on an
+# instance; contract-admin events (create, setProperties, addProperty, ...)
+# are deliberately out. Like touched_accounts, this reads only what HE's own
+# transaction already reported inline -- no derivation.
+_EVENT_OPS = {
+    "issue": "issue",
+    "transfer": "transfer",
+    "burn": "burn",
+    "delegate": "delegate",
+    "undelegate": "undelegate",
+    "undelegateStart": "undelegate_start",
+    "undelegateDone": "undelegate_done",
+    "sellOrder": "market_list",
+    "cancelOrder": "market_cancel",
+    "changePrice": "market_price_change",
+}
+
+
+def nft_events(tx: dict, he_block: int, ts) -> list[dict]:
+    """Activity-feed rows from one nft/nftmarket transaction's emitted
+    events (see _EVENT_OPS; `hitSellOrder` expands into one `market_buy`
+    per instance sold, mirroring market_sales()). Rows carry no tx_seq --
+    the caller assigns it per block, since idempotency is per (block, seq)."""
+    if not is_nft_tx(tx.get("contract")):
+        return []
+    logs = _load_json(tx.get("logs"), {})
+    tx_id = tx.get("transactionId")
+    events: list[dict] = []
+
+    def row(op, symbol, nft_id, account, counterparty, price, price_symbol):
+        events.append({
+            "symbol": symbol, "nft_id": nft_id, "op": op,
+            "account": account, "counterparty": counterparty,
+            "price": price, "price_symbol": price_symbol,
+            "tx_id": tx_id, "he_block": he_block, "ts": ts,
+        })
+
+    for event in (logs or {}).get("events", []):
+        name = event.get("event")
+        data = event.get("data") or {}
+        if name == "hitSellOrder":
+            symbol = data.get("symbol")
+            buyer = data.get("account")
+            for seller in data.get("sellers", []):
+                for sale in seller.get("nftSales", []):
+                    if sale.get("id") is None or symbol is None:
+                        continue
+                    try:
+                        nft_id = int(sale["id"])
+                    except (TypeError, ValueError):
+                        continue
+                    row("market_buy", symbol, nft_id, buyer,
+                        seller.get("account"), sale.get("price"),
+                        sale.get("symbol") or data.get("priceSymbol"))
+            continue
+        op = _EVENT_OPS.get(name)
+        if op is None:
+            continue
+        symbol = data.get("symbol")
+        raw_id = data.get("id", data.get("nftId"))
+        if symbol is None or raw_id is None:
+            continue
+        try:
+            nft_id = int(raw_id)
+        except (TypeError, ValueError):
+            continue
+        row(op, symbol, nft_id,
+            data.get("from") or data.get("account"), data.get("to"),
+            data.get("price", data.get("newPrice")), data.get("priceSymbol"))
+    return events
+
+
 def market_sales(tx: dict, he_block: int, ts) -> list[dict]:
     """Completed trades from one nftmarket `buy` transaction's own
     `hitSellOrder` events (the ack packet HE emits per fill). Each event

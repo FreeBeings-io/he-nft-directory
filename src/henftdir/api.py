@@ -27,7 +27,7 @@ from decimal import Decimal
 from typing import Any, Callable
 from urllib.parse import parse_qs
 
-from . import db, sync
+from . import config, db, sync
 from .display import apply_mapping, load_mappings
 from .henodes import HENodes
 
@@ -336,6 +336,60 @@ def market(params: dict, symbol: str) -> dict:
                 orders[-1]["nft_id"] if len(orders) == limit else None}
 
 
+def _activity_coverage() -> dict:
+    """How much of the advisory window the feed actually holds right now:
+    live capture runs from deploy; the backfill fills backward toward the
+    window start and reports its own progress."""
+    state = {r["name"]: r["last_he_block"] for r in _q(
+        "SELECT name, last_he_block FROM sync_state "
+        "WHERE name IN ('activity_backfill', 'activity_backfill_target')")}
+    cursor = state.get("activity_backfill")
+    target = state.get("activity_backfill_target")
+    oldest = _q("SELECT min(ts) AS t FROM nft_events")[0]["t"]
+    return {
+        "window_days": config.ACTIVITY_WINDOW_DAYS,
+        "oldest_event_ts": oldest,
+        "backfill_complete": (cursor is not None and target is not None
+                              and cursor <= target),
+        "backfill_cursor_block": cursor,
+        "backfill_target_block": target,
+    }
+
+
+def account_activity(params: dict, account: str) -> dict:
+    """Rolling recent-activity feed for one account (as actor OR
+    counterparty) -- capture-only rows from nft_events, newest first,
+    keyset-paginated on (he_block, tx_seq) packed into one integer cursor.
+    Deliberately does NOT trigger a cold-fetch: activity is what we
+    captured while watching, independent of holdings-cache population."""
+    cursor, limit = _page(params)
+    where = "(account = %s OR counterparty = %s)"
+    args: list = [account, account]
+    if params.get("symbol"):
+        where += " AND symbol = %s"
+        args.append(params["symbol"])
+    if params.get("op"):
+        where += " AND op = %s"
+        args.append(params["op"])
+    # pack (he_block, tx_seq) into one orderable int; parse is bounded well
+    # under 10k events per block, so the packing can't collide
+    if cursor:
+        where += " AND (he_block * 10000 + tx_seq) < %s"
+        args.append(cursor)
+    rows = _q(
+        f"SELECT he_block, tx_seq, symbol, nft_id, op, account, counterparty, "
+        f"price, price_symbol, tx_id, ts FROM nft_events WHERE {where} "
+        f"ORDER BY he_block DESC, tx_seq DESC LIMIT %s",
+        (*args, limit),
+    )
+    next_cursor = (rows[-1]["he_block"] * 10000 + rows[-1]["tx_seq"]
+                   if len(rows) == limit else None)
+    for row in rows:
+        row.pop("tx_seq", None)  # internal ordering detail, not API surface
+    return {"account": account, "events": rows,
+            "coverage": _activity_coverage(), "next_cursor": next_cursor}
+
+
 def status(params: dict) -> dict:
     sync_state = {r["name"]: r for r in _q("SELECT * FROM sync_state")}
     known = _q("SELECT count(*) AS n FROM known_accounts")[0]["n"]
@@ -352,12 +406,14 @@ def status(params: dict) -> dict:
         "known_accounts": known,
         "refresh_queue_depth": queue_depth,
         "display_mapping_coverage": coverage,
+        "activity": _activity_coverage(),
         "disclosure": "This service is a read-through cache over Hive "
                       "Engine's own current state, populated only for "
                       "accounts that have been queried at least once. It "
-                      "is not a historical ledger -- there is no "
-                      "transaction-history endpoint, and holdings reflect "
-                      "the last refresh, not necessarily this exact instant.",
+                      "is not a historical ledger -- holdings reflect the "
+                      "last refresh, and the only event data served is a "
+                      "rolling recent-activity feed (see activity.window_"
+                      "days); older events are pruned, not archived.",
     }
 
 
@@ -365,6 +421,7 @@ def status(params: dict) -> dict:
 
 ROUTES: list[tuple[re.Pattern, Callable]] = [
     (re.compile(r"^/accounts/([a-z0-9.-]{3,16})/nfts$"), account_nfts),
+    (re.compile(r"^/accounts/([a-z0-9.-]{3,16})/activity$"), account_activity),
     (re.compile(r"^/collections$"), collections_list),
     (re.compile(r"^/collections/([A-Z0-9]+)$"), collection_detail),
     (re.compile(r"^/nfts/([A-Z0-9]+)/(\d+)$"), nft_detail),

@@ -29,6 +29,14 @@ its own concurrency budget, rate limiter, and backoff state:
 - refresh_worker + catalog + safety-net: share one pool. These are the
   "bulk, some delay is fine" account-refresh loops; the catalog sweep is
   light and periodic, so it rides along without issue.
+- activity backfill: its own pool. It's the lowest-priority loop in the
+  service (an advisory feed filling backward through old blocks), so it
+  must never compete with anything above -- and nothing above should ever
+  be slowed because the backfill is running.
+
+Two more loops complete the activity feed: the live capture rides inside
+the block-watcher (parse_block), and a daily prune keeps nft_events inside
+the retention window.
 
 The read-through-cache shape is deliberate: work scales with actual usage
 (accounts queried), never with collection size.
@@ -87,13 +95,15 @@ class Service:
         await setup.close()
 
         async with HENodes() as watcher_nodes, HENodes() as market_nodes, \
-                HENodes() as bulk_nodes:
+                HENodes() as bulk_nodes, HENodes() as activity_nodes:
             tasks = [
                 asyncio.create_task(blockwatch.run(self.app_dsn, watcher_nodes, self.stop)),
                 asyncio.create_task(self._refresh_worker(bulk_nodes)),
                 asyncio.create_task(self._catalog_loop(bulk_nodes)),
                 asyncio.create_task(self._market_loop(market_nodes)),
                 asyncio.create_task(self._safety_net_loop(bulk_nodes)),
+                asyncio.create_task(self._activity_backfill_loop(activity_nodes)),
+                asyncio.create_task(self._activity_prune_loop()),
             ]
             stop_task = asyncio.create_task(self.stop.wait())
             try:
@@ -147,6 +157,88 @@ class Service:
                     await conn.rollback()
                 with contextlib.suppress(asyncio.TimeoutError):
                     await asyncio.wait_for(self.stop.wait(), timeout=self.market_interval)
+        finally:
+            await conn.close()
+
+    async def _activity_backfill_loop(self, nodes: HENodes) -> None:
+        """Fill the activity window BACKWARD from the deploy-time head
+        toward (head - window). Low priority by design: small bursts with
+        pauses, its own node pool, checkpointed in sync_state so restarts
+        resume, and per-block failures are retried then skipped (missing
+        one historical block from an advisory feed beats wedging). On
+        completion it parks on stop.wait() -- returning would end the
+        service's task group and shut everything down."""
+        conn = await db.connect(self.app_dsn)
+        try:
+            state = {r["name"]: r["last_he_block"] for r in await (await conn.execute(
+                "SELECT name, last_he_block FROM sync_state WHERE name IN "
+                "('activity_backfill', 'activity_backfill_target')"
+            )).fetchall()}
+            cursor = state.get("activity_backfill")
+            target = state.get("activity_backfill_target")
+            if cursor is None or target is None:
+                latest = await nodes.get_latest_block()
+                head = latest["blockNumber"]
+                target = max(1, head - config.ACTIVITY_WINDOW_DAYS * config.ACTIVITY_BLOCKS_PER_DAY)
+                cursor = head - 1  # live watcher owns head onward
+                await conn.execute(
+                    "INSERT INTO sync_state (name, last_he_block) VALUES "
+                    "('activity_backfill', %s), ('activity_backfill_target', %s) "
+                    "ON CONFLICT (name) DO UPDATE SET "
+                    "last_he_block = EXCLUDED.last_he_block, updated_at = now()",
+                    (cursor, target),
+                )
+                await conn.commit()
+                logger.info("activity backfill: %d -> %d (~%d blocks)",
+                            cursor, target, cursor - target)
+            while not self.stop.is_set() and cursor > target:
+                try:
+                    for _ in range(config.ACTIVITY_BACKFILL_BATCH):
+                        if self.stop.is_set() or cursor <= target:
+                            break
+                        block = await nodes.get_block(cursor)
+                        if block is not None:
+                            await blockwatch.process_block_capture_only(conn, block)
+                        cursor -= 1
+                    await conn.execute(
+                        "UPDATE sync_state SET last_he_block = %s, updated_at = now() "
+                        "WHERE name = 'activity_backfill'", (cursor,),
+                    )
+                    await conn.commit()
+                except Exception as exc:
+                    logger.error("activity backfill: %r (at block %d)", exc, cursor)
+                    await conn.rollback()
+                    cursor -= 1  # skip a persistently-failing block; feed is advisory
+                with contextlib.suppress(asyncio.TimeoutError):
+                    await asyncio.wait_for(
+                        self.stop.wait(), timeout=config.ACTIVITY_BACKFILL_PAUSE_SECONDS)
+            if cursor <= target:
+                logger.info("activity backfill complete (window start block %d)", target)
+            await self.stop.wait()
+        finally:
+            await conn.close()
+
+    async def _activity_prune_loop(self) -> None:
+        """Drop activity events older than the retention window. Runs once
+        at startup then daily (founder call: relaxed cadence over constant
+        delete churn -- a 30-day window overshoots by at most ~3%)."""
+        conn = await db.connect(self.app_dsn)
+        try:
+            while not self.stop.is_set():
+                try:
+                    cur = await conn.execute(
+                        "DELETE FROM nft_events WHERE ts < now() - interval '1 day' * %s",
+                        (config.ACTIVITY_WINDOW_DAYS,),
+                    )
+                    await conn.commit()
+                    if cur.rowcount:
+                        logger.info("activity prune: dropped %d event(s)", cur.rowcount)
+                except Exception as exc:
+                    logger.error("activity prune failed: %r", exc)
+                    await conn.rollback()
+                with contextlib.suppress(asyncio.TimeoutError):
+                    await asyncio.wait_for(
+                        self.stop.wait(), timeout=config.ACTIVITY_PRUNE_INTERVAL_SECONDS)
         finally:
             await conn.close()
 

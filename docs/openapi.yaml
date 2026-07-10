@@ -7,7 +7,9 @@ info:
     metadata, and market state — a read-through cache over Hive Engine's own
     current state, not a historical ledger. An account is populated the first
     time it's queried and kept current by a background block-watcher from
-    then on; there is no transaction-history endpoint.
+    then on; there is no transaction-history archive — the closest thing is
+    `/accounts/{account}/activity`, a rolling recent-activity feed whose
+    events are pruned past its retention window.
 
     **Draft status.** This document mirrors `src/henftdir/api.py`. Response
     shapes are pre-release drafts and may change before v1 locks.
@@ -191,6 +193,50 @@ paths:
         '400': { $ref: '#/components/responses/BadRequest' }
         '500': { $ref: '#/components/responses/ServerError' }
 
+  /accounts/{account}/activity:
+    get:
+      operationId: getAccountActivity
+      tags: [Accounts]
+      summary: Recent activity — rolling window of NFT events
+      description: >-
+        NFT events (issue, transfer, burn, delegation, market list/cancel/
+        price-change/buy) where the account was the actor or counterparty,
+        newest first. This is a rolling recent-activity feed, NOT a
+        transaction-history archive: events older than the retention window
+        (`coverage.window_days`) are pruned, and coverage may still be
+        filling backward shortly after a deployment (`coverage.backfill_
+        complete`). Serves whatever is captured immediately — never blocks
+        on backfill, and never triggers a holdings fetch.
+      parameters:
+        - $ref: '#/components/parameters/AccountPath'
+        - $ref: '#/components/parameters/SymbolFilter'
+        - name: op
+          in: query
+          description: Restrict to one event type (e.g. `transfer`, `market_buy`).
+          schema:
+            type: string
+            enum: [issue, transfer, burn, delegate, undelegate,
+                   undelegate_start, undelegate_done, market_list,
+                   market_cancel, market_price_change, market_buy]
+        - $ref: '#/components/parameters/Cursor'
+        - $ref: '#/components/parameters/Limit'
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  account: { type: string }
+                  events:
+                    type: array
+                    items: { $ref: '#/components/schemas/ActivityEvent' }
+                  coverage: { $ref: '#/components/schemas/ActivityCoverage' }
+                  next_cursor: { $ref: '#/components/schemas/NextCursor' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '500': { $ref: '#/components/responses/ServerError' }
+
   /status:
     get:
       operationId: getStatus
@@ -199,7 +245,8 @@ paths:
       description: >-
         Per-loop last-seen HE block (block_watcher; also written by the
         catalog/market sweeps), how many accounts are cached, how deep the
-        refresh queue currently is, and display-mapping coverage. There is
+        refresh queue currently is, display-mapping coverage, and the
+        activity feed's window/backfill coverage. There is
         no reconciliation metric in this design — the cache doesn't derive
         state, it mirrors HE directly on every refresh, so "correct" just
         means "not yet due for a refresh."
@@ -280,6 +327,42 @@ components:
       type: integer
       nullable: true
       description: Pass back as `?cursor=` for the next page; `null` means this was the last page.
+
+    ActivityEvent:
+      type: object
+      description: >-
+        One captured NFT event, exactly as Hive Engine's own transaction
+        reported it — capture-only, never derived. `account` is the primary
+        actor (sender/buyer), `counterparty` the other side (recipient/
+        seller) where the event has one.
+      properties:
+        he_block: { type: integer }
+        symbol: { type: string }
+        nft_id: { type: integer, nullable: true }
+        op:
+          type: string
+          enum: [issue, transfer, burn, delegate, undelegate,
+                 undelegate_start, undelegate_done, market_list,
+                 market_cancel, market_price_change, market_buy]
+        account: { type: string, nullable: true }
+        counterparty: { type: string, nullable: true }
+        price: { type: string, nullable: true }
+        price_symbol: { type: string, nullable: true }
+        tx_id: { type: string, nullable: true }
+        ts: { type: string, format: date-time }
+
+    ActivityCoverage:
+      type: object
+      description: >-
+        How much of the advisory window the feed holds right now. Live
+        capture runs from deployment; a background backfill fills backward
+        toward the window start and reports its progress here.
+      properties:
+        window_days: { type: integer }
+        oldest_event_ts: { type: string, format: date-time, nullable: true }
+        backfill_complete: { type: boolean }
+        backfill_cursor_block: { type: integer, nullable: true }
+        backfill_target_block: { type: integer, nullable: true }
 
     DisplayObject:
       type: object
@@ -473,4 +556,5 @@ components:
           properties:
             mapped: { type: integer }
             total: { type: integer }
+        activity: { $ref: '#/components/schemas/ActivityCoverage' }
         disclosure: { type: string }

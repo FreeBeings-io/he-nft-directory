@@ -138,6 +138,32 @@ CREATE TABLE IF NOT EXISTS market_sales (
 );
 CREATE INDEX IF NOT EXISTS market_sales_symbol_ts_idx ON market_sales (symbol, ts DESC);
 
+-- Rolling activity feed: nft/nftmarket events captured by the block-watcher
+-- (live) and the activity backfill loop (backward from deploy toward the
+-- retention window's start). Like market_sales this is capture-only -- it
+-- never feeds holdings state -- but unlike market_sales it is PRUNED to the
+-- retention window (ACTIVITY_WINDOW_DAYS): a bounded recent-activity feed,
+-- deliberately not an archive. (he_block, tx_seq) is idempotent because the
+-- parse is deterministic: reprocessing a block yields the same sequence.
+CREATE TABLE IF NOT EXISTS nft_events (
+    he_block     bigint NOT NULL,
+    tx_seq       integer NOT NULL,
+    symbol       text NOT NULL,
+    nft_id       bigint,
+    op           text NOT NULL,
+    account      text,
+    counterparty text,
+    price        numeric,
+    price_symbol text,
+    tx_id        text,
+    ts           timestamptz NOT NULL,
+    PRIMARY KEY (he_block, tx_seq)
+);
+CREATE INDEX IF NOT EXISTS nft_events_account_ts_idx ON nft_events (account, ts DESC);
+CREATE INDEX IF NOT EXISTS nft_events_counterparty_ts_idx ON nft_events (counterparty, ts DESC);
+CREATE INDEX IF NOT EXISTS nft_events_symbol_ts_idx ON nft_events (symbol, ts DESC);
+CREATE INDEX IF NOT EXISTS nft_events_ts_idx ON nft_events (ts);
+
 -- Versioned display adapters: raw properties -> normalized
 -- {name, image, collection, attributes}. Append-only per symbol.
 CREATE TABLE IF NOT EXISTS display_mappings (

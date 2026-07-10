@@ -21,6 +21,18 @@ All notable changes to **he-nft-directory** are recorded here. Format follows
   shape, valuation semantics, freshness, and rate limits are still being
   finalized) — including whether a history endpoint is ever added; there is
   deliberately none in this design.
+- Recent-activity feed: `GET /accounts/{account}/activity` — NFT events
+  (issue, transfer, burn, delegation, market list/cancel/price-change/buy)
+  where the account was actor or counterparty, newest first. A **rolling
+  window** (default 30 days), not a history archive: the block-watcher
+  captures events live, a low-priority background loop backfills backward
+  toward the window start (its own node pool; the service is fully usable
+  while it runs, and `/status` + the response's `coverage` object report
+  progress honestly), and a daily prune drops events past the window.
+  Hive Engine itself offers no working NFT history source — its RPC nodes
+  have no history methods and the official sidecar's `nftHistory` endpoint
+  serves no data (verified live) — so this feed is capture-only from what
+  the block-watcher itself witnessed, and deliberately bounded.
 - Market valuation. Floor price is rolled up per payment token **and per
   group** — HE sell orders carry a grouping (e.g. rarity/type), and one
   collection often spans hundreds of groups, so a single symbol-wide floor

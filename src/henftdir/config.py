@@ -98,3 +98,24 @@ MARKET_MAX_PAGES = 10
 # misparsed block. Batched and slow on purpose.
 SAFETY_NET_INTERVAL_SECONDS = 3600
 SAFETY_NET_BATCH_SIZE = 200
+
+# Rolling activity feed (nft_events): captured live by the block-watcher,
+# backfilled backward toward the window start by a low-priority background
+# loop, pruned past the window. The window is a product promise ("recent
+# activity"), not an archive -- see the nft_events schema comment.
+ACTIVITY_WINDOW_DAYS = 30
+# Backfill politeness: BATCH blocks per burst, then PAUSE. 20 blocks / 5s
+# (~4 blocks/s) walks a 30-day window (~850k blocks) in roughly 2.5 days --
+# deliberately slow; the feed serves partial coverage honestly meanwhile
+# (see /status activity.backfill). Uses its own small HENodes pool so it
+# can never starve the block-watcher or the market sweep.
+ACTIVITY_BACKFILL_BATCH = 20
+ACTIVITY_BACKFILL_PAUSE_SECONDS = 5.0
+# Prune once a day (founder call): with a 30-day window a daily prune
+# overshoots retention by at most ~3%, and one small indexed DELETE per day
+# beats constant delete churn.
+ACTIVITY_PRUNE_INTERVAL_SECONDS = 86400
+# HE blocks track Hive blocks ~1:1 (measured 0.98 recently), so the window
+# start is approximated as head - days * 28800 Hive-blocks/day. The window
+# is advisory ("about 30 days"), so drift of a few percent is fine.
+ACTIVITY_BLOCKS_PER_DAY = 28800
