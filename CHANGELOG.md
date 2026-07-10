@@ -43,6 +43,11 @@ All notable changes to **he-nft-directory** are recorded here. Format follows
   trade-history endpoint, so this is the only source. It is capture-only and
   never feeds holdings state.
 
+- Deployment-shape knobs are env-overridable, so Docker operators can
+  point at a self-hosted Hive Engine node without rebuilding the image:
+  `HENFT_HE_NODES` (comma-separated), `HENFT_HE_MAX_CONCURRENCY`,
+  `HENFT_HE_CALL_SPACING`. See docs/DEPLOY.md §3.
+
 ### Fixed
 
 All found live during and after the first real deploy:

@@ -58,7 +58,10 @@ Notes:
   queries (per-account, per-symbol), never a bulk scan of an entire
   collection — see `sync.py`'s module docstring for why that matters
   (some HE collections have 10s of millions of instances).
-- Optional env vars (both roles): `LOG_LEVEL` (default `INFO`). API-only:
+- Optional env vars (both roles): `LOG_LEVEL` (default `INFO`);
+  `HENFT_HE_NODES` (comma-separated Hive Engine RPC endpoints — overrides
+  the shipped public-node list, see §3), `HENFT_HE_MAX_CONCURRENCY` and
+  `HENFT_HE_CALL_SPACING` (politeness tuning, see §3). API-only:
   `WEB_CONCURRENCY` (gunicorn workers, default 2), `WEB_TIMEOUT` (gunicorn
   worker timeout in seconds, default 90 — a never-before-seen account's
   first query does a synchronous ~150-table cold-fetch before responding;
@@ -66,17 +69,31 @@ Notes:
 
 ## 3. Community / self-hosted deployment
 
-`HE_NODES` (`src/henftdir/config.py`) is a plain list of Hive Engine RPC
-endpoints — public nodes by default. For a production or community
-deployment, point it at a self-hosted HE node instead (the witness node
-software is open source): no shared public rate limits, lower latency,
-and you're not dependent on a third party's node staying up. No code
-change needed beyond the node list; this is a first-class supported
-deployment shape, not a hack. `HE_MAX_CONCURRENCY` /
-`HE_MIN_CALL_SPACING_SECONDS` in the same file are tuned conservatively
-for shared public nodes — a self-hosted node under your own control can
-likely take a much higher rate; re-measure against your own node rather
-than assuming the shipped defaults are a ceiling.
+The service ships pointed at public Hive Engine RPC nodes and works
+out of the box against them. For a production or community deployment,
+point it at a self-hosted HE node instead (the witness node software is
+open source): no shared public rate limits, lower latency, and you're
+not dependent on a third party's node staying up. This is a first-class
+supported deployment shape, not a hack — set one env var on the sync
+service, no rebuild needed:
+
+```yaml
+  henftdir-sync:
+    environment:
+      HENFT_HE_NODES: http://my-he-node:5000        # comma-separate for several
+      # Politeness defaults are tuned for SHARED PUBLIC nodes. A node you
+      # own can likely take much more -- measure, then raise:
+      HENFT_HE_MAX_CONCURRENCY: "16"                 # default 4
+      HENFT_HE_CALL_SPACING: "0.01"                  # seconds/node, default 0.1
+```
+
+The same defaults live in `src/henftdir/config.py` (`HE_NODES`,
+`HE_MAX_CONCURRENCY`, `HE_MIN_CALL_SPACING_SECONDS`) if you're running
+from source and prefer editing them directly. One membership rule,
+learned in production: a rotation node must serve BOTH the `blockchain`
+and `contracts` endpoints unrestricted — some public nodes rate-limit
+`contracts` `find` queries by policy while answering block lookups fine,
+which quietly degrades market-book pagination and account refreshes.
 
 ## 4. Display mappings
 

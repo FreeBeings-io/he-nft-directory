@@ -1,4 +1,23 @@
-"""Static configuration defaults."""
+"""Configuration: static defaults, with the deployment-shape knobs
+overridable via environment variables (see docs/DEPLOY.md) -- a Docker
+operator must be able to point at their own Hive Engine node and retune
+politeness without rebuilding the image."""
+
+import os
+
+
+def _env_float(name: str, default: float) -> float:
+    try:
+        return float(os.environ[name])
+    except (KeyError, ValueError):
+        return default
+
+
+def _env_int(name: str, default: int) -> int:
+    try:
+        return int(os.environ[name])
+    except (KeyError, ValueError):
+        return default
 
 # Public Hive Engine RPC nodes (health + cross-node consensus verified
 # 2026-07-10: identical block/database hashes at a settled block; the client
@@ -16,6 +35,11 @@ HE_NODES = [
     "https://herpc.dtools.dev",
     "https://enginerpc.com",
 ]
+# Deployment override: HENFT_HE_NODES as a comma-separated list, e.g.
+#   HENFT_HE_NODES=http://my-he-node:5000   (self-hosted; see DEPLOY.md §3)
+if os.environ.get("HENFT_HE_NODES"):
+    HE_NODES = [n.strip() for n in os.environ["HENFT_HE_NODES"].split(",")
+                if n.strip()]
 
 # Politeness toward public HE nodes: bounded concurrency, spacing between
 # calls, AIMD backoff on failure -- a fixed cooldown re-hammers a
@@ -37,7 +61,7 @@ HE_NODES = [
 # traffic would produce. 4 leaves real margin against the *bursty* access
 # pattern actually seen live, not the isolated one -- re-measure with a
 # real cold-fetch (not an isolated ramp) before raising it.
-HE_MAX_CONCURRENCY = 4
+HE_MAX_CONCURRENCY = _env_int("HENFT_HE_MAX_CONCURRENCY", 4)
 # Per node (see henodes.py's HENodes._throttle -- fixed 2026-07-08 to
 # actually enforce this per node under concurrency; it was previously an
 # unguarded global check-and-update that let concurrent callers race past
@@ -49,7 +73,7 @@ HE_MAX_CONCURRENCY = 4
 # blamed) most likely because this session's own cumulative testing had
 # gotten the testing IP flagged. Re-measure from a clean vantage point
 # before trusting this number either way.
-HE_MIN_CALL_SPACING_SECONDS = 0.1
+HE_MIN_CALL_SPACING_SECONDS = _env_float("HENFT_HE_CALL_SPACING", 0.1)
 HE_REQUEST_TIMEOUT_SECONDS = 20
 HE_FAILURE_BACKOFF_FLOOR_SECONDS = 30
 # A 503 response (the server answered, just under momentary load) gets a
