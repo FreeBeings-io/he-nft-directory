@@ -391,7 +391,14 @@ def account_activity(params: dict, account: str) -> dict:
 
 
 def status(params: dict) -> dict:
-    sync_state = {r["name"]: r for r in _q("SELECT * FROM sync_state")}
+    # sync = loop FRESHNESS only. The activity backfill's cursor/target
+    # checkpoints also live in sync_state but are internal bookkeeping (the
+    # target row never updates after init, so surfacing it here made the
+    # service look stale); they're served through `activity` instead.
+    sync_state = {r["name"]: r for r in _q(
+        "SELECT * FROM sync_state "
+        "WHERE name NOT IN ('activity_backfill', 'activity_backfill_target') "
+        "ORDER BY name")}
     known = _q("SELECT count(*) AS n FROM known_accounts")[0]["n"]
     queue_depth = _q("SELECT count(*) AS n FROM refresh_queue")[0]["n"]
     coverage = _q(
