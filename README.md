@@ -38,7 +38,7 @@ accounts people actually query.
 
 Implemented and live against mainnet. The API surface is a pre-release
 draft — display-object shape, valuation semantics, freshness, and rate
-limits may still change before endpoints freeze at v0.1.0.
+limits may still change before endpoints freeze at v1.
 
 ## Running
 
@@ -50,8 +50,14 @@ python -m henftdir --dsn dbname=henftdir
 gunicorn -w 4 'henftdir.api:application'
 ```
 
-Endpoints: `/accounts/{account}/nfts`, `/collections[/{symbol}]`,
-`/nfts/{symbol}/{id}`, `/market/{symbol}`, `/status`.
+Endpoints: `/accounts/{account}/nfts`, `/accounts/{account}/activity`,
+`/collections[/{symbol}]`, `/nfts/{symbol}/{id}`, `/market/{symbol}`,
+`/status`.
+
+Runs against public Hive Engine RPC nodes out of the box. To run against
+your own HE node instead, set `HENFT_HE_NODES` (comma-separated) on the
+sync service — no rebuild needed; see
+[docs/DEPLOY.md §3](docs/DEPLOY.md) for details and rate-tuning.
 
 ## Principles (binding on the build)
 
