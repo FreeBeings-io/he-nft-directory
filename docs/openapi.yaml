@@ -33,9 +33,10 @@ externalDocs:
   description: Repository
   url: https://github.com/FreeBeings-io/he-nft-directory
 servers:
-  - url: https://TBD.example
+  - url: https://hive-apis.freebeings.io/he-nft
     description: >-
-      Production — domain not yet decided. Placeholder only.
+      Production. Self-hosted deployments substitute their own base URL —
+      every endpoint works the same against any instance.
   - url: http://localhost:8080
     description: Local dev — `gunicorn -w 4 'henftdir.api:application'`
 tags:
