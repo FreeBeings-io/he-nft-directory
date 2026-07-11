@@ -98,11 +98,36 @@ async def test_record_sales_is_idempotent_on_reprocess():
 async def test_queue_refresh_dedupes():
     conn = await fresh_conn("bw_dedupe")
     try:
-        await blockwatch.queue_refresh(conn, {"alice"})
-        await blockwatch.queue_refresh(conn, {"alice", "bob"})
+        await blockwatch.queue_refresh(conn, {("alice", "")})
+        await blockwatch.queue_refresh(conn, {("alice", ""), ("bob", "STAR")})
         await conn.commit()
-        rows = await (await conn.execute("SELECT account FROM refresh_queue")).fetchall()
-        assert sorted(r["account"] for r in rows) == ["alice", "bob"]
+        rows = await (await conn.execute(
+            "SELECT account, symbol FROM refresh_queue ORDER BY account"
+        )).fetchall()
+        assert [(r["account"], r["symbol"]) for r in rows] == [
+            ("alice", ""), ("bob", "STAR")]
+    finally:
+        await conn.close()
+
+
+async def test_process_block_queues_targeted_pairs():
+    """An event that names the touched symbol queues a targeted refresh for
+    both sides; the sender is covered by the event, not double-queued as a
+    full refresh."""
+    conn = await fresh_conn("bw_targeted")
+    try:
+        block = {"blockNumber": 5, "timestamp": "2026-07-11T00:00:00",
+                 "transactions": [tx("nft", "alice", action="transfer", events=[{
+                     "contract": "nft", "event": "transfer",
+                     "data": {"from": "alice", "to": "bob",
+                              "symbol": "STAR", "id": "7"}}])]}
+        await blockwatch.process_block(conn, block)
+        await conn.commit()
+        rows = await (await conn.execute(
+            "SELECT account, symbol FROM refresh_queue ORDER BY account"
+        )).fetchall()
+        assert [(r["account"], r["symbol"]) for r in rows] == [
+            ("alice", "STAR"), ("bob", "STAR")]
     finally:
         await conn.close()
 

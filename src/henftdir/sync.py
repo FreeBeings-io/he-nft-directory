@@ -176,6 +176,7 @@ async def _fetch_symbol_for_account(
 async def refresh_account(
     conn: psycopg.AsyncConnection, nodes: HENodes, account: str,
     symbols: list[str], pace: float = 0.0,
+    dequeue_symbols: list[str] | None = None,
 ) -> int:
     """Authoritative re-fetch of one account's current holdings across every
     known symbol. Used both for the first-ever (cold) lookup and for
@@ -269,7 +270,18 @@ async def refresh_account(
         "ON CONFLICT (account) DO UPDATE SET refreshed_at = now()",
         (account,),
     )
-    await conn.execute("DELETE FROM refresh_queue WHERE account = %s", (account,))
+    # Dequeue only what this pass actually covered: a targeted refresh
+    # (dequeue_symbols set) must not clear other symbols' queue rows --
+    # including ones that arrived while it ran. A full refresh clears the
+    # account's whole queue, '' entry included.
+    if dequeue_symbols is None:
+        await conn.execute(
+            "DELETE FROM refresh_queue WHERE account = %s", (account,))
+    else:
+        await conn.execute(
+            "DELETE FROM refresh_queue WHERE account = %s AND symbol = ANY(%s)",
+            (account, dequeue_symbols),
+        )
     await conn.commit()
     return len(rows)
 
@@ -289,8 +301,14 @@ async def refresh_worker(
     row = None
     while not stop.is_set():
         try:
+            # One account at a time, all of its queued symbols at once (a
+            # burst of activity across several collections still collapses
+            # to a single pass). A '' entry means at least one touch
+            # couldn't be attributed to a symbol -> full refresh.
             row = await (await conn.execute(
-                "SELECT account FROM refresh_queue ORDER BY queued_at LIMIT 1"
+                "SELECT account, array_agg(DISTINCT symbol) AS syms "
+                "FROM refresh_queue GROUP BY account "
+                "ORDER BY min(queued_at) LIMIT 1"
             )).fetchone()
             if row is None:
                 # Refresh the symbol list while idle, not on every single
@@ -300,8 +318,17 @@ async def refresh_worker(
                 with contextlib.suppress(asyncio.TimeoutError):
                     await asyncio.wait_for(stop.wait(), timeout=config.REFRESH_IDLE_SECONDS)
                 continue
-            await refresh_account(conn, nodes, row["account"], symbols,
-                                  pace=config.REFRESH_PACE_SECONDS)
+            syms = row["syms"] or []
+            if "" in syms:
+                await refresh_account(conn, nodes, row["account"], symbols,
+                                      pace=config.REFRESH_PACE_SECONDS)
+            else:
+                # Targeted: re-check only the touched collections (~40x
+                # cheaper than the full sweep); dequeue exactly these rows
+                # so touches arriving mid-refresh aren't lost.
+                await refresh_account(conn, nodes, row["account"], syms,
+                                      pace=config.REFRESH_PACE_SECONDS,
+                                      dequeue_symbols=syms)
         except Exception as exc:
             logger.error(
                 "refresh_worker: %s failed: %r",

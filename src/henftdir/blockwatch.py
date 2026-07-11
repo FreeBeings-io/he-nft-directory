@@ -42,13 +42,21 @@ def _block_ts(value) -> datetime:
     return datetime.now(timezone.utc)
 
 
-async def queue_refresh(conn: psycopg.AsyncConnection, accounts: set[str]) -> None:
-    if not accounts:
+async def queue_refresh(
+    conn: psycopg.AsyncConnection, pairs: set[tuple[str, str]]
+) -> None:
+    """Queue (account, symbol) refresh work. symbol '' = full-account
+    refresh; a non-empty symbol is a targeted single-collection re-check
+    (see the refresh_queue schema comment for why that distinction is the
+    difference between draining and stalling at scale)."""
+    if not pairs:
         return
+    accounts, symbols = zip(*pairs)
     await conn.execute(
-        "INSERT INTO refresh_queue (account) SELECT unnest(%s::text[]) "
-        "ON CONFLICT (account) DO UPDATE SET queued_at = now()",
-        (list(accounts),),
+        "INSERT INTO refresh_queue (account, symbol) "
+        "SELECT * FROM unnest(%s::text[], %s::text[]) "
+        "ON CONFLICT (account, symbol) DO UPDATE SET queued_at = now()",
+        (list(accounts), list(symbols)),
     )
 
 
@@ -93,11 +101,17 @@ async def record_events(conn: psycopg.AsyncConnection, events: list[dict]) -> No
         )
 
 
-def parse_block(block: dict) -> tuple[set[str], list[dict], list[dict]]:
+def parse_block(block: dict) -> tuple[set[tuple[str, str]], list[dict], list[dict]]:
     """One deterministic pass over a block's nft/nftmarket txs:
-    (touched accounts, completed sales, activity events with tx_seq
-    assigned in encounter order)."""
-    accounts: set[str] = set()
+    ((account, symbol) refresh pairs, completed sales, activity events
+    with tx_seq assigned in encounter order).
+
+    Refresh pairs are TARGETED wherever an emitted event names the exact
+    collection an account was touched in (transfer/issue/market ops all
+    do); only accounts that appear in the tx without any event naming
+    their symbol (payload-only parses, e.g. setProperties-shaped actions)
+    fall back to a full-account refresh (symbol '')."""
+    pairs: set[tuple[str, str]] = set()
     sales: list[dict] = []
     events: list[dict] = []
     he_block = block.get("blockNumber")
@@ -108,24 +122,36 @@ def parse_block(block: dict) -> tuple[set[str], list[dict], list[dict]]:
         # tx-contract gate silently drops -- both for activity capture and,
         # worse, for refresh queueing (found in the activity-feed review;
         # previously only the hourly safety-net caught those holders).
-        if catalog.has_nft_activity(tx):
-            accounts |= catalog.touched_accounts(tx)
-            sales.extend(catalog.market_sales(tx, he_block, ts))
-            events.extend(catalog.nft_events(tx, he_block, ts))
+        if not catalog.has_nft_activity(tx):
+            continue
+        tx_events = catalog.nft_events(tx, he_block, ts)
+        sales.extend(catalog.market_sales(tx, he_block, ts))
+        events.extend(tx_events)
+        targeted: set[tuple[str, str]] = {
+            (acct, e["symbol"])
+            for e in tx_events
+            for acct in (e.get("account"), e.get("counterparty"))
+            if acct and e.get("symbol")
+        }
+        pairs |= targeted
+        covered = {acct for acct, _ in targeted}
+        pairs |= {(acct, "") for acct in catalog.touched_accounts(tx)
+                  if acct not in covered}
     for seq, event in enumerate(events):
         event["tx_seq"] = seq
-    return accounts, sales, events
+    return pairs, sales, events
 
 
 async def process_block(conn: psycopg.AsyncConnection, block: dict) -> int:
-    """Queue every account touched by this block's nft/nftmarket txs, and
+    """Queue refresh work for every account touched by this block's
+    nft/nftmarket txs (targeted per symbol where the events name one), and
     record any completed market trades + activity events. Returns the
     number of distinct accounts queued."""
-    accounts, sales, events = parse_block(block)
-    await queue_refresh(conn, accounts)
+    pairs, sales, events = parse_block(block)
+    await queue_refresh(conn, pairs)
     await record_sales(conn, sales)
     await record_events(conn, events)
-    return len(accounts)
+    return len({acct for acct, _ in pairs})
 
 
 async def process_block_capture_only(conn: psycopg.AsyncConnection, block: dict) -> int:

@@ -52,6 +52,16 @@ All notable changes to **he-nft-directory** are recorded here. Format follows
 
 All found live during and after the first real deploy:
 
+- Refresh throughput now scales with activity instead of with catalog
+  size: the block-watcher's event parse knows exactly which collection a
+  transaction touched, so the refresh queue carries (account, symbol)
+  pairs and the worker re-checks only the touched collections (~40x
+  cheaper than the full sweep it previously ran for every queued touch).
+  Full-account refreshes remain for first-ever fetches, payload-only
+  touches where no event names a symbol, and the safety-net's periodic
+  insurance pass. Existing deployments migrate the queue schema in place
+  on startup.
+
 - Background account refreshes no longer hammer the node pool: a heavy
   account's ~150-symbol refresh at full pool speed put every HE node into
   cooldown at once, causing a "no nodes" retry storm for everything else

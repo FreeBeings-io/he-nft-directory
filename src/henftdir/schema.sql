@@ -50,13 +50,34 @@ CREATE INDEX IF NOT EXISTS known_accounts_refreshed_at_idx
 -- *events* -- just "go re-fetch this account's current state," deduped by
 -- account (a burst of activity for the same account collapses to one
 -- re-fetch, not one per touch).
+-- symbol = '' means "full-account refresh" (all known symbols): used for
+-- first-ever fetches and for touches where the affected symbol can't be
+-- determined (payload-only parses). A non-empty symbol is a TARGETED
+-- refresh: the block-watcher's event parse knows exactly which collection
+-- a tx touched, and re-checking only that one is ~40x cheaper than the
+-- full ~115-symbol sweep -- the difference between draining a busy queue
+-- and stalling behind it as known accounts grow.
 CREATE TABLE IF NOT EXISTS refresh_queue (
-    account     text PRIMARY KEY,
-    queued_at   timestamptz NOT NULL DEFAULT now()
+    account     text NOT NULL,
+    symbol      text NOT NULL DEFAULT '',
+    queued_at   timestamptz NOT NULL DEFAULT now(),
+    PRIMARY KEY (account, symbol)
 );
 -- refresh_worker orders by this on every poll.
 CREATE INDEX IF NOT EXISTS refresh_queue_queued_at_idx
     ON refresh_queue (queued_at);
+-- migrate a pre-(account,symbol) deployment in place (idempotent: the DO
+-- block only fires while the old single-column PK is still present)
+ALTER TABLE refresh_queue ADD COLUMN IF NOT EXISTS symbol text NOT NULL DEFAULT '';
+DO $$
+BEGIN
+    IF (SELECT count(*) FROM information_schema.key_column_usage
+        WHERE table_name = 'refresh_queue'
+          AND constraint_name = 'refresh_queue_pkey') < 2 THEN
+        ALTER TABLE refresh_queue DROP CONSTRAINT refresh_queue_pkey;
+        ALTER TABLE refresh_queue ADD PRIMARY KEY (account, symbol);
+    END IF;
+END $$;
 
 -- Current holdings, mirrored from HE's own `{symbol}instances` tables --
 -- but ONLY for accounts in known_accounts. Never eagerly populated for an
