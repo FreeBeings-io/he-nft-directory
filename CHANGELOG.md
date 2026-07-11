@@ -52,6 +52,14 @@ All notable changes to **he-nft-directory** are recorded here. Format follows
 
 All found live during and after the first real deploy:
 
+- Background account refreshes no longer hammer the node pool: a heavy
+  account's ~150-symbol refresh at full pool speed put every HE node into
+  cooldown at once, causing a "no nodes" retry storm for everything else
+  in flight. Queue-drain and safety-net refreshes are now paced between
+  chunks (the synchronous first-query fetch stays full-speed — a user is
+  waiting on it), and collections with zero issued instances (37 of 152)
+  are skipped entirely.
+
 - NFT activity happening inside OTHER contracts' transactions (pack
   openings and any contract that issues/moves NFTs internally) was
   invisible to the block-watcher: it gated on the transaction's own

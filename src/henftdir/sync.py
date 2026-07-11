@@ -104,7 +104,26 @@ async def refresh_catalog(conn: psycopg.AsyncConnection, nodes: HENodes) -> int:
 
 
 async def known_symbols(conn: psycopg.AsyncConnection) -> list[str]:
-    rows = await (await conn.execute("SELECT symbol FROM collections")).fetchall()
+    """Symbols worth querying for an account refresh: collections with at
+    least one issued instance. A 2026-07-10 full-catalog audit found 37 of
+    152 collections have zero instances platform-wide -- querying those on
+    every refresh is ~25% of the cold-fetch burst for guaranteed-empty
+    answers. NULL circulating_supply is kept (unknown != empty); a
+    collection's first-ever issue is picked up at the next catalog sweep.
+
+    The EXISTS arm closes a burn-race staleness hole: if a collection's
+    last instances are burned while we still hold cached rows, filtering
+    on circulating_supply alone would skip the symbol forever and the
+    stale "owned" rows could never be refreshed away. Any symbol we still
+    have cached instances for stays queryable until a confirmed-empty
+    refresh deletes those rows -- after which this arm stops matching, so
+    the extra queries self-extinguish. (instances' PK is (symbol, nft_id),
+    so the EXISTS probe is an index prefix hit.)"""
+    rows = await (await conn.execute(
+        "SELECT symbol FROM collections c "
+        "WHERE c.circulating_supply IS NULL OR c.circulating_supply > 0 "
+        "   OR EXISTS (SELECT 1 FROM instances i WHERE i.symbol = c.symbol)"
+    )).fetchall()
     return [r["symbol"] for r in rows]
 
 
@@ -156,7 +175,7 @@ async def _fetch_symbol_for_account(
 
 async def refresh_account(
     conn: psycopg.AsyncConnection, nodes: HENodes, account: str,
-    symbols: list[str],
+    symbols: list[str], pace: float = 0.0,
 ) -> int:
     """Authoritative re-fetch of one account's current holdings across every
     known symbol. Used both for the first-ever (cold) lookup and for
@@ -168,7 +187,15 @@ async def refresh_account(
     (fetch succeeded, even if the confirmed result was empty) -- a symbol
     whose lookup failed keeps whatever was cached before (or stays absent,
     on a first-ever fetch) rather than being wiped to "owns nothing" on a
-    transient HE hiccup."""
+    transient HE hiccup.
+
+    pace > 0 inserts that many seconds between concurrency-sized chunks of
+    symbol lookups -- for BACKGROUND callers (refresh worker, safety-net),
+    where latency is free and the un-paced burst was found live to push
+    every node into cooldown at once (a "no nodes" retry storm on anything
+    else in flight). The synchronous API cold-fetch keeps pace=0: a user is
+    waiting on that path, and one burst per never-seen account is the
+    documented cost."""
     if not symbols:
         # The catalog hasn't been populated yet (a narrow window right
         # after a fresh deploy, before the first catalog refresh
@@ -182,9 +209,20 @@ async def refresh_account(
             "populated, skipping", account,
         )
         return 0
-    results = await asyncio.gather(
-        *(_fetch_symbol_for_account(nodes, symbol, account) for symbol in symbols)
-    )
+    if pace > 0:
+        results = []
+        step = config.HE_MAX_CONCURRENCY
+        for i in range(0, len(symbols), step):
+            results.extend(await asyncio.gather(
+                *(_fetch_symbol_for_account(nodes, s, account)
+                  for s in symbols[i:i + step])
+            ))
+            if i + step < len(symbols):
+                await asyncio.sleep(pace)
+    else:
+        results = await asyncio.gather(
+            *(_fetch_symbol_for_account(nodes, symbol, account) for symbol in symbols)
+        )
     confirmed_symbols = [s for s, r in zip(symbols, results) if r is not None]
     rows = [
         _instance_row(symbol, rec)
@@ -262,7 +300,8 @@ async def refresh_worker(
                 with contextlib.suppress(asyncio.TimeoutError):
                     await asyncio.wait_for(stop.wait(), timeout=config.REFRESH_IDLE_SECONDS)
                 continue
-            await refresh_account(conn, nodes, row["account"], symbols)
+            await refresh_account(conn, nodes, row["account"], symbols,
+                                  pace=config.REFRESH_PACE_SECONDS)
         except Exception as exc:
             logger.error(
                 "refresh_worker: %s failed: %r",
@@ -298,7 +337,8 @@ async def safety_net_sweep(
     )).fetchall()
     for row in rows:
         try:
-            await refresh_account(conn, nodes, row["account"], symbols)
+            await refresh_account(conn, nodes, row["account"], symbols,
+                                  pace=config.REFRESH_PACE_SECONDS)
         except Exception as exc:
             logger.error("safety-net: %s failed: %r", row["account"], exc)
             await conn.rollback()

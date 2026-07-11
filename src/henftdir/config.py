@@ -109,6 +109,14 @@ BLOCKWATCH_IDLE_SECONDS = 3.0
 
 # refresh_worker: idle wait when refresh_queue is empty.
 REFRESH_IDLE_SECONDS = 5.0
+# Pause between concurrency-sized chunks of symbol lookups for BACKGROUND
+# account refreshes (queue drain + safety-net) -- found live 2026-07-10: an
+# un-paced ~115-symbol refresh saturates the pool for several seconds,
+# 503-cooldowns every node at once, and produces a "no nodes" retry storm
+# for anything else in flight (~4k retry warnings in hours from one heavy
+# account). Background latency is free; the API's synchronous cold-fetch
+# stays un-paced (a user is waiting).
+REFRESH_PACE_SECONDS = 0.5
 
 # Full collection-catalog mirror (~150 rows platform-wide) -- cheap, so
 # refreshed often relative to the safety-net sweep below.
