@@ -8,6 +8,8 @@ change); a history endpoint is deliberately not part of this design.
 
 ## [Unreleased]
 
+## [0.5.0] - 2026-07-17
+
 ### Changed
 - Widened the default Hive Engine node pool from 4 to 9 (added
   herpc.kanibot.com, api.primersion.com, herpc.tribaldex.com,
