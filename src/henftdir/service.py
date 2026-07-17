@@ -122,9 +122,13 @@ class Service:
         logger.info("shutdown complete")
 
     async def _refresh_worker(self, nodes: HENodes) -> None:
+        # Control connection (claim/known_symbols/idle) is owned here; the
+        # worker opens its own per-slot connections from this factory for
+        # concurrent account draining and closes them itself.
         conn = await db.connect(self.app_dsn)
         try:
-            await sync.refresh_worker(conn, nodes, self.stop)
+            await sync.refresh_worker(
+                conn, lambda: db.connect(self.app_dsn), nodes, self.stop)
         finally:
             await conn.close()
 

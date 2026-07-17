@@ -327,91 +327,127 @@ async def refresh_account(
     return len(rows)
 
 
+async def _reschedule_account(conn: psycopg.AsyncConnection, account: str) -> None:
+    """Push an account's queue rows out by an exponential backoff after a
+    HARD refresh failure (whole pass raised, not just some symbols). This
+    un-sticks the queue without dropping work -- the old code DELETEd the
+    row, which only the (now-removed) safety-net sweep ever came back for.
+    not_before hides the account for the backoff window."""
+    await conn.execute(
+        "UPDATE refresh_queue SET attempts = attempts + 1, "
+        "not_before = now() + least("
+        "  make_interval(secs => %s * power(2, least(attempts, 10))), "
+        "  make_interval(secs => %s)) "
+        "WHERE account = %s",
+        (config.REFRESH_RETRY_BASE_SECONDS,
+         config.REFRESH_RETRY_CAP_SECONDS, account),
+    )
+    await conn.commit()
+
+
+async def _refresh_one(
+    conn: psycopg.AsyncConnection, nodes: HENodes, account: str,
+    syms: list[str], all_symbols: list[str],
+) -> None:
+    """Refresh one claimed account on its OWN connection, so a batch of
+    accounts refreshes concurrently and one account's failure (or its
+    connection's rollback) can never touch another's transaction. A ''
+    entry means a touch couldn't be attributed to a symbol -> full
+    refresh; otherwise re-check only the touched collections (~40x cheaper)
+    and dequeue exactly those rows so touches arriving mid-refresh aren't
+    lost."""
+    try:
+        if "" in syms:
+            await refresh_account(conn, nodes, account, all_symbols,
+                                  pace=config.REFRESH_PACE_SECONDS)
+        else:
+            await refresh_account(conn, nodes, account, syms,
+                                  pace=config.REFRESH_PACE_SECONDS,
+                                  dequeue_symbols=syms)
+    except Exception as exc:
+        logger.error("refresh_worker: %s failed: %r", account, exc)
+        # Fully isolated: roll back and reschedule on THIS account's own
+        # connection; guard the cleanup too so a broken connection can't
+        # escape into the gather and take the batch down.
+        try:
+            await conn.rollback()
+            await _reschedule_account(conn, account)
+        except Exception as exc2:
+            logger.error("refresh_worker: reschedule for %s failed: %r", account, exc2)
+            with contextlib.suppress(Exception):
+                await conn.rollback()
+
+
 async def refresh_worker(
-    conn: psycopg.AsyncConnection, nodes: HENodes, stop: asyncio.Event,
+    conn: psycopg.AsyncConnection, connect, nodes: HENodes,
+    stop: asyncio.Event, batch: int | None = None,
 ) -> None:
     """Drains refresh_queue -- accounts the block-watcher flagged as
-    touched. Idles briefly when empty rather than polling tightly.
+    touched -- up to `batch` accounts CONCURRENTLY, each on its own
+    connection. Serial draining was the throughput ceiling (~1.1s/account
+    measured live); parallel draining fills the shared HE node budget
+    (config.HE_MAX_CONCURRENCY, which still caps total HE-call concurrency)
+    instead of leaving it idle between one account's lookups.
 
-    The whole iteration is guarded -- found live that only the
-    refresh_account() call itself was wrapped, so a failure in the plain
-    SELECT above it (or in known_symbols()) would have been unhandled and
-    crashed the service, the same class of bug the missing rollback here
-    already caused once."""
-    symbols = await known_symbols(conn)
-    row = None
-    while not stop.is_set():
-        try:
-            # One account at a time, all of its queued symbols at once (a
-            # burst of activity across several collections still collapses
-            # to a single pass). A '' entry means at least one touch
-            # couldn't be attributed to a symbol -> full refresh.
-            # not_before gates retry rows: a symbol in backoff is invisible
-            # until its window opens, so a struggling lookup can't hot-loop
-            # at the head of the queue while fresh work waits behind it.
-            row = await (await conn.execute(
-                "SELECT account, array_agg(DISTINCT symbol) AS syms "
-                "FROM refresh_queue WHERE not_before <= now() "
-                "GROUP BY account ORDER BY min(queued_at) LIMIT 1"
-            )).fetchone()
-            if row is None:
-                # Refresh the symbol list while idle, not on every single
-                # queued account -- the catalog rarely changes, so paying
-                # for this query once per busy-queue item is pure overhead.
-                symbols = await known_symbols(conn)
-                # Release the transaction these reads opened before idling.
-                # This connection is autocommit=False, so an uncommitted
-                # read leaves it "idle in transaction" holding its MVCC
-                # snapshot (and backend_xmin) for the whole idle wait; the
-                # next poll then reuses that stale snapshot and never sees
-                # rows other connections (block-watcher, API) have since
-                # inserted -- a wedged queue that only grows. Found live
-                # 2026-07-17: the worker pinned a snapshot from the moment
-                # the queue first emptied and stopped draining entirely.
-                # The refresh_account path commits on its own, so only this
-                # read-only idle branch needed closing.
+    `conn` is the CONTROL connection (claim + known_symbols + idle wait,
+    caller-owned); `connect` is an async factory returning a fresh
+    connection per concurrent worker slot (owned + closed here).
+
+    The claim/idle body is guarded so a failure in the claim SELECT or
+    known_symbols can't crash the service; per-account failures are handled
+    inside _refresh_one on their own connections."""
+    batch = batch or config.REFRESH_WORKER_BATCH
+    workers = [await connect() for _ in range(batch)]
+    try:
+        symbols = await known_symbols(conn)
+        await conn.rollback()  # release the read's snapshot (see idle note below)
+        while not stop.is_set():
+            try:
+                # not_before gates retry rows: a symbol/account in backoff
+                # is invisible until its window opens, so a struggling
+                # lookup can't hot-loop the queue head while fresh work
+                # waits. GROUP BY account so all of one account's queued
+                # symbols collapse into a single pass.
+                rows = await (await conn.execute(
+                    "SELECT account, array_agg(DISTINCT symbol) AS syms "
+                    "FROM refresh_queue WHERE not_before <= now() "
+                    "GROUP BY account ORDER BY min(queued_at) LIMIT %s",
+                    (batch,),
+                )).fetchall()
+                # Release the claim read's transaction before slow work or
+                # idling. This conn is autocommit=False, so an uncommitted
+                # read leaves it "idle in transaction" pinning its MVCC
+                # snapshot; the next poll would reuse that stale snapshot
+                # and never see newly-queued rows -- the wedge found live
+                # 2026-07-17. (refresh_account commits on the worker conns.)
                 await conn.rollback()
+                if not rows:
+                    # Catalog rarely changes -- refresh the symbol list only
+                    # when idle, not once per queued account.
+                    symbols = await known_symbols(conn)
+                    await conn.rollback()
+                    with contextlib.suppress(asyncio.TimeoutError):
+                        await asyncio.wait_for(stop.wait(), timeout=config.REFRESH_IDLE_SECONDS)
+                    continue
+                # Distinct accounts (GROUP BY), so each worker slot owns a
+                # different account -- no cross-slot queue contention.
+                await asyncio.gather(*(
+                    _refresh_one(workers[i], nodes, r["account"],
+                                 r["syms"] or [], symbols)
+                    for i, r in enumerate(rows)
+                ))
+            except Exception as exc:
+                # Claim-side failure only (per-account failures never reach
+                # here -- _refresh_one swallows them). Roll back and idle.
+                logger.error("refresh_worker: claim failed: %r", exc)
+                with contextlib.suppress(Exception):
+                    await conn.rollback()
                 with contextlib.suppress(asyncio.TimeoutError):
                     await asyncio.wait_for(stop.wait(), timeout=config.REFRESH_IDLE_SECONDS)
-                continue
-            syms = row["syms"] or []
-            if "" in syms:
-                await refresh_account(conn, nodes, row["account"], symbols,
-                                      pace=config.REFRESH_PACE_SECONDS)
-            else:
-                # Targeted: re-check only the touched collections (~40x
-                # cheaper than the full sweep); dequeue exactly these rows
-                # so touches arriving mid-refresh aren't lost.
-                await refresh_account(conn, nodes, row["account"], syms,
-                                      pace=config.REFRESH_PACE_SECONDS,
-                                      dequeue_symbols=syms)
-        except Exception as exc:
-            logger.error(
-                "refresh_worker: %s failed: %r",
-                row["account"] if row else "<select failed>", exc,
-            )
-            # A failed statement poisons the connection until rolled back --
-            # found live (crashed the whole service): without this, the
-            # cleanup below raises InFailedSqlTransaction, an unhandled
-            # exception distinct from the one this except block caught.
-            await conn.rollback()
-            if row is not None:
-                # Reschedule with backoff instead of deleting -- the old
-                # delete avoided a stuck head-of-queue entry but silently
-                # LOST the work (only the safety-net sweep ever came back
-                # for it, and that sweep is gone). not_before pushes the
-                # account out of the worker's sight for the backoff window,
-                # which un-sticks the queue head without dropping anything.
-                await conn.execute(
-                    "UPDATE refresh_queue SET attempts = attempts + 1, "
-                    "not_before = now() + least("
-                    "  make_interval(secs => %s * power(2, least(attempts, 10))), "
-                    "  make_interval(secs => %s)) "
-                    "WHERE account = %s",
-                    (config.REFRESH_RETRY_BASE_SECONDS,
-                     config.REFRESH_RETRY_CAP_SECONDS, row["account"]),
-                )
-                await conn.commit()
+    finally:
+        for w in workers:
+            with contextlib.suppress(Exception):
+                await w.close()
 
 
 # The hourly safety-net sweep was REMOVED (2026-07-17, founder decision):

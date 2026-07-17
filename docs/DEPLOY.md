@@ -66,7 +66,10 @@ Notes:
   (activity-backfill pacing: blocks per burst / seconds between bursts,
   defaults 10 / 10.0 — tuned for shared public nodes; open the throttle
   on a self-hosted node), `HENFT_ACCOUNT_STALE_AFTER` (seconds before a
-  cached account read triggers a background re-fetch, default 21600).
+  cached account read triggers a background re-fetch, default 21600),
+  `HENFT_REFRESH_WORKER_BATCH` (queued accounts the sync worker refreshes
+  concurrently, each on its own DB connection; default =
+  `HENFT_HE_MAX_CONCURRENCY`, bounded overall by the HE node semaphore).
   API-only:
   `WEB_CONCURRENCY` (gunicorn workers, default 2), `WEB_TIMEOUT` (gunicorn
   worker timeout in seconds, default 90 — a never-before-seen account's

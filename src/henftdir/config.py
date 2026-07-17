@@ -130,6 +130,17 @@ BLOCKWATCH_IDLE_SECONDS = 3.0
 
 # refresh_worker: idle wait when refresh_queue is empty.
 REFRESH_IDLE_SECONDS = 5.0
+# Account-level parallelism: how many queued accounts the worker drains
+# concurrently, each on its own DB connection. Serial draining (batch=1)
+# was the throughput ceiling -- measured live 2026-07-17 at ~1.1s/account,
+# so a block touching 1000 accounts took ~19 min to reflect. Total HE-call
+# concurrency stays bounded by the shared node semaphore
+# (HE_MAX_CONCURRENCY) no matter how large this is, so batching just fills
+# that already-node-safe budget instead of leaving it idle between one
+# account's lookups. Defaults to the node budget (enough to keep it full
+# when accounts are single-symbol); raise for multi-symbol-heavy workloads
+# at the cost of more DB connections (host PG max_connections is 100).
+REFRESH_WORKER_BATCH = _env_int("HENFT_REFRESH_WORKER_BATCH", HE_MAX_CONCURRENCY)
 # Pause between concurrency-sized chunks of symbol lookups for BACKGROUND
 # account refreshes (queue drain) -- found live 2026-07-10: an
 # un-paced ~115-symbol refresh saturates the pool for several seconds,

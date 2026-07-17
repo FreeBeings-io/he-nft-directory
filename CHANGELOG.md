@@ -8,6 +8,19 @@ change); a history endpoint is deliberately not part of this design.
 
 ## [Unreleased]
 
+## [0.7.0] - 2026-07-17
+
+### Changed
+- The refresh worker now drains queued accounts **concurrently** (up to
+  `HENFT_REFRESH_WORKER_BATCH`, default = the HE node budget), each on its
+  own connection, instead of one account at a time. Serial draining was
+  the throughput ceiling — measured ~1.1s/account, so a block touching
+  1000 accounts took ~19 min to reflect. Total HE-call concurrency stays
+  bounded by the shared node semaphore, so this fills the already-node-safe
+  budget rather than adding upstream load. Per-account failures are now
+  isolated on their own connections (one account's error can't disturb the
+  others in the batch).
+
 ## [0.6.1] - 2026-07-17
 
 ### Fixed
