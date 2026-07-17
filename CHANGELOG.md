@@ -8,6 +8,23 @@ change); a history endpoint is deliberately not part of this design.
 
 ## [Unreleased]
 
+### Changed
+- Freshness now scales with usage instead of fleet size — the hourly
+  safety-net sweep is removed, replaced by three guarantees:
+  - **Durable retries**: a symbol lookup that fails during any refresh is
+    re-queued with exponential backoff (`refresh_queue` gained
+    `attempts`/`not_before`, migrated in place on startup) instead of
+    silently dropped; a failed refresh-worker pass reschedules rather than
+    deleting the queue entry. Pending retries are visible at `/status`
+    (`refresh_retries`).
+  - **Staleness-bounded reads**: reading an account whose cache is older
+    than `HENFT_ACCOUNT_STALE_AFTER` (default 6h) serves the cache and
+    enqueues a background re-fetch.
+  - **Unknown-event alarm**: an nft-contract event name the parser has
+    never seen logs a warning (once per name) — refresh triggering is
+    name-agnostic and unaffected, but this makes an HE contract change
+    visible instead of silent.
+
 ## [0.5.0] - 2026-07-17
 
 ### Changed

@@ -25,8 +25,10 @@ once) and kept current afterward by a lightweight background service:
 - **refresh worker**: drains that queue, re-fetching each account's full
   current holdings straight from HE and overwriting the cache.
 - periodic sweeps keep the collection catalog and market order books
-  fresh, and a slow safety-net re-touches every known account as
-  insurance against a missed block.
+  fresh. Failed lookups are re-queued durably with exponential backoff
+  (never silently dropped), and an account read older than its staleness
+  bound triggers a background re-fetch — so correction work scales with
+  actual usage and actual failures, not with how many accounts are cached.
 
 There is deliberately no transaction ledger and no `/history` endpoint:
 Hive Engine's largest collections hold tens of millions of instances, so

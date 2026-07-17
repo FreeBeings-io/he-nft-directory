@@ -40,8 +40,11 @@ CREATE TABLE IF NOT EXISTS known_accounts (
     first_seen_at timestamptz NOT NULL DEFAULT now(),
     refreshed_at  timestamptz NOT NULL DEFAULT now()
 );
--- safety_net_sweep orders by this on every sweep; without an index this
--- is a full-table sort that gets slower as more accounts get cached.
+-- refreshed_at = last FULL refresh pass (targeted single-symbol
+-- re-checks deliberately don't bump it -- it's what the read-staleness
+-- bound measures against). The index's original consumer (the safety-net
+-- sweep's ORDER BY) is gone; kept because it's tiny and useful for ops
+-- queries over staleness distribution.
 CREATE INDEX IF NOT EXISTS known_accounts_refreshed_at_idx
     ON known_accounts (refreshed_at);
 
@@ -57,15 +60,28 @@ CREATE INDEX IF NOT EXISTS known_accounts_refreshed_at_idx
 -- a tx touched, and re-checking only that one is ~40x cheaper than the
 -- full ~115-symbol sweep -- the difference between draining a busy queue
 -- and stalling behind it as known accounts grow.
+-- attempts/not_before make this queue the DURABLE RETRY LEDGER too: a
+-- symbol lookup that fails during any refresh (queued, cold-fetch, or
+-- read-staleness) is re-inserted here with attempts+1 and an exponential
+-- not_before backoff, so no failure can silently become permanent
+-- staleness -- every touch either completes or sits here, visibly
+-- pending (surfaced via /status refresh_retries). This is what replaced
+-- the hourly safety-net sweep: correction work now scales with actual
+-- failures and actual usage, never with fleet size.
 CREATE TABLE IF NOT EXISTS refresh_queue (
     account     text NOT NULL,
     symbol      text NOT NULL DEFAULT '',
     queued_at   timestamptz NOT NULL DEFAULT now(),
+    attempts    int NOT NULL DEFAULT 0,
+    not_before  timestamptz NOT NULL DEFAULT now(),
     PRIMARY KEY (account, symbol)
 );
 -- refresh_worker orders by this on every poll.
 CREATE INDEX IF NOT EXISTS refresh_queue_queued_at_idx
     ON refresh_queue (queued_at);
+-- migrate a pre-retry-ledger deployment in place
+ALTER TABLE refresh_queue ADD COLUMN IF NOT EXISTS attempts int NOT NULL DEFAULT 0;
+ALTER TABLE refresh_queue ADD COLUMN IF NOT EXISTS not_before timestamptz NOT NULL DEFAULT now();
 -- migrate a pre-(account,symbol) deployment in place (idempotent: the DO
 -- block only fires while the old single-column PK is still present)
 ALTER TABLE refresh_queue ADD COLUMN IF NOT EXISTS symbol text NOT NULL DEFAULT '';

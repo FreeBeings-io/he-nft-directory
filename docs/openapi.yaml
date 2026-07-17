@@ -551,6 +551,17 @@ components:
         refresh_queue_depth:
           type: integer
           description: Accounts flagged by the block-watcher, awaiting a refresh.
+        refresh_retries:
+          type: object
+          description: >-
+            Queue rows that have failed at least once and are waiting out an
+            exponential backoff before being re-attempted. Non-zero is normal
+            during upstream Hive Engine trouble; a permanently growing count
+            means lookups are failing faster than backoff windows reopen.
+          properties:
+            pending: { type: integer }
+            max_attempts: { type: integer, nullable: true }
+            next_retry_at: { type: string, format: date-time, nullable: true }
         display_mapping_coverage:
           type: object
           properties:

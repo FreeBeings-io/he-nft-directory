@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import os
 import re
 import threading
@@ -30,6 +31,8 @@ from urllib.parse import parse_qs
 from . import config, db, sync
 from .display import apply_mapping, load_mappings
 from .henodes import HENodes
+
+logger = logging.getLogger(__name__)
 
 DSN = os.environ.get("HENFT_DSN", "dbname=henftdir")
 MAX_LIMIT = 1000
@@ -101,14 +104,43 @@ async def _cold_fetch_account(account: str) -> None:
         await conn.close()
 
 
+def _enqueue_stale_refresh(account: str) -> None:
+    """Queue a background full-account refresh -- fire-and-forget, on a
+    short-lived WRITE connection (the request-serving connection is
+    read-only by design). DO NOTHING on conflict: if the account is
+    already queued (including a retry row in backoff), don't reset its
+    position or its backoff. Any failure here is swallowed -- staleness
+    correction must never break a read that the cache can already serve."""
+    try:
+        with db.connect_sync(DSN) as wconn:
+            wconn.execute(
+                "INSERT INTO refresh_queue (account, symbol) VALUES (%s, '') "
+                "ON CONFLICT (account, symbol) DO NOTHING", (account,),
+            )
+            wconn.commit()
+    except Exception:
+        logger.warning("stale-refresh enqueue failed for %s", account,
+                       exc_info=True)
+
+
 def _ensure_known(account: str) -> None:
-    """First query for this account ever -> populate it now, synchronously.
-    Every later query is served straight from the cache -- see sync.py's
-    module docstring for why a per-account refresh is fast regardless of
-    how large any single collection is."""
-    if _q("SELECT 1 FROM known_accounts WHERE account = %s", (account,)):
-        return
-    asyncio.run(_cold_fetch_account(account))
+    """First query for this account ever -> populate it now, synchronously;
+    every later query is served straight from the cache. If the cached
+    account has gone stale (older than ACCOUNT_STALE_AFTER_SECONDS),
+    serve the cache as-is but enqueue a background refresh -- the
+    freshness bound rides on access, so correction work scales with real
+    usage instead of fleet size (this replaced the hourly full-fleet
+    safety-net sweep). See sync.py's module docstring for why a
+    per-account refresh is fast regardless of collection size."""
+    row = _q(
+        "SELECT refreshed_at < now() - make_interval(secs => %s) AS stale "
+        "FROM known_accounts WHERE account = %s",
+        (config.ACCOUNT_STALE_AFTER_SECONDS, account),
+    )
+    if not row:
+        asyncio.run(_cold_fetch_account(account))
+    elif row[0]["stale"]:
+        _enqueue_stale_refresh(account)
 
 
 async def _cold_fetch_instance(symbol: str, nft_id: int) -> bool:
@@ -401,6 +433,15 @@ def status(params: dict) -> dict:
         "ORDER BY name")}
     known = _q("SELECT count(*) AS n FROM known_accounts")[0]["n"]
     queue_depth = _q("SELECT count(*) AS n FROM refresh_queue")[0]["n"]
+    # Pending retries = queue rows that have already failed at least once.
+    # Non-zero is normal during upstream HE trouble; what matters is that
+    # it drains afterward -- a permanently growing count means lookups are
+    # failing faster than the backoff windows reopen.
+    retries = _q(
+        "SELECT count(*) AS pending, max(attempts) AS max_attempts, "
+        "min(not_before) AS next_retry_at "
+        "FROM refresh_queue WHERE attempts > 0",
+    )[0]
     coverage = _q(
         "SELECT count(*) FILTER (WHERE m.symbol IS NOT NULL) AS mapped, "
         "count(*) AS total FROM ("
@@ -412,6 +453,7 @@ def status(params: dict) -> dict:
         "sync": sync_state,
         "known_accounts": known,
         "refresh_queue_depth": queue_depth,
+        "refresh_retries": retries,
         "display_mapping_coverage": coverage,
         "activity": _activity_coverage(),
         "disclosure": "This service is a read-through cache over Hive "

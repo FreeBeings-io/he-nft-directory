@@ -173,6 +173,31 @@ async def _fetch_symbol_for_account(
         return None
 
 
+async def _requeue_failed(
+    conn: psycopg.AsyncConnection, account: str, failed_symbols: list[str],
+) -> None:
+    """Re-enqueue symbols whose lookup failed this pass, with exponential
+    per-row backoff (attempts doubles the delay, capped). This is what
+    makes every refresh path self-healing: a transient HE failure becomes
+    a visible pending retry instead of silent staleness waiting for a
+    sweep that no longer exists. not_before keeps a struggling symbol from
+    hot-looping at the head of the queue while nodes are down."""
+    if not failed_symbols:
+        return
+    await conn.execute(
+        "INSERT INTO refresh_queue (account, symbol, attempts, not_before) "
+        "SELECT %s, s, 1, now() + make_interval(secs => %s) "
+        "FROM unnest(%s::text[]) AS s "
+        "ON CONFLICT (account, symbol) DO UPDATE SET "
+        "attempts = refresh_queue.attempts + 1, "
+        "not_before = now() + least("
+        "  make_interval(secs => %s * power(2, least(refresh_queue.attempts, 10))), "
+        "  make_interval(secs => %s))",
+        (account, config.REFRESH_RETRY_BASE_SECONDS, failed_symbols,
+         config.REFRESH_RETRY_BASE_SECONDS, config.REFRESH_RETRY_CAP_SECONDS),
+    )
+
+
 async def refresh_account(
     conn: psycopg.AsyncConnection, nodes: HENodes, account: str,
     symbols: list[str], pace: float = 0.0,
@@ -191,7 +216,7 @@ async def refresh_account(
     transient HE hiccup.
 
     pace > 0 inserts that many seconds between concurrency-sized chunks of
-    symbol lookups -- for BACKGROUND callers (refresh worker, safety-net),
+    symbol lookups -- for BACKGROUND callers (the refresh worker),
     where latency is free and the un-paced burst was found live to push
     every node into cooldown at once (a "no nodes" retry storm on anything
     else in flight). The synchronous API cold-fetch keeps pace=0: a user is
@@ -265,15 +290,29 @@ async def refresh_account(
                 "properties = EXCLUDED.properties, refreshed_at = now()",
                 rows,
             )
-    await conn.execute(
-        "INSERT INTO known_accounts (account) VALUES (%s) "
-        "ON CONFLICT (account) DO UPDATE SET refreshed_at = now()",
-        (account,),
-    )
+    # refreshed_at means "last FULL pass over every known symbol" -- it is
+    # what the read-staleness bound (api._ensure_known) measures against.
+    # A targeted single-symbol re-check must NOT reset it: with the
+    # safety-net sweep gone, letting frequent targeted touches keep
+    # bumping the clock would mean an active account never trips its
+    # periodic full re-check while its untouched symbols drift.
+    if dequeue_symbols is None:
+        await conn.execute(
+            "INSERT INTO known_accounts (account) VALUES (%s) "
+            "ON CONFLICT (account) DO UPDATE SET refreshed_at = now()",
+            (account,),
+        )
+    else:
+        await conn.execute(
+            "INSERT INTO known_accounts (account) VALUES (%s) "
+            "ON CONFLICT (account) DO NOTHING", (account,),
+        )
     # Dequeue only what this pass actually covered: a targeted refresh
     # (dequeue_symbols set) must not clear other symbols' queue rows --
     # including ones that arrived while it ran. A full refresh clears the
-    # account's whole queue, '' entry included.
+    # account's whole queue, '' entry included. Failed symbols are then
+    # re-enqueued with backoff (after the dequeue, so the retry rows
+    # survive it) -- no lookup failure is ever silently dropped.
     if dequeue_symbols is None:
         await conn.execute(
             "DELETE FROM refresh_queue WHERE account = %s", (account,))
@@ -282,6 +321,8 @@ async def refresh_account(
             "DELETE FROM refresh_queue WHERE account = %s AND symbol = ANY(%s)",
             (account, dequeue_symbols),
         )
+    await _requeue_failed(
+        conn, account, [s for s, r in zip(symbols, results) if r is None])
     await conn.commit()
     return len(rows)
 
@@ -305,10 +346,13 @@ async def refresh_worker(
             # burst of activity across several collections still collapses
             # to a single pass). A '' entry means at least one touch
             # couldn't be attributed to a symbol -> full refresh.
+            # not_before gates retry rows: a symbol in backoff is invisible
+            # until its window opens, so a struggling lookup can't hot-loop
+            # at the head of the queue while fresh work waits behind it.
             row = await (await conn.execute(
                 "SELECT account, array_agg(DISTINCT symbol) AS syms "
-                "FROM refresh_queue GROUP BY account "
-                "ORDER BY min(queued_at) LIMIT 1"
+                "FROM refresh_queue WHERE not_before <= now() "
+                "GROUP BY account ORDER BY min(queued_at) LIMIT 1"
             )).fetchone()
             if row is None:
                 # Refresh the symbol list while idle, not on every single
@@ -340,37 +384,32 @@ async def refresh_worker(
             # exception distinct from the one this except block caught.
             await conn.rollback()
             if row is not None:
-                # avoid a permanently stuck head-of-queue entry on repeated failure
+                # Reschedule with backoff instead of deleting -- the old
+                # delete avoided a stuck head-of-queue entry but silently
+                # LOST the work (only the safety-net sweep ever came back
+                # for it, and that sweep is gone). not_before pushes the
+                # account out of the worker's sight for the backoff window,
+                # which un-sticks the queue head without dropping anything.
                 await conn.execute(
-                    "DELETE FROM refresh_queue WHERE account = %s", (row["account"],)
+                    "UPDATE refresh_queue SET attempts = attempts + 1, "
+                    "not_before = now() + least("
+                    "  make_interval(secs => %s * power(2, least(attempts, 10))), "
+                    "  make_interval(secs => %s)) "
+                    "WHERE account = %s",
+                    (config.REFRESH_RETRY_BASE_SECONDS,
+                     config.REFRESH_RETRY_CAP_SECONDS, row["account"]),
                 )
                 await conn.commit()
 
 
-async def safety_net_sweep(
-    conn: psycopg.AsyncConnection, nodes: HENodes,
-) -> int:
-    """Slow, periodic re-touch of every known account, oldest-refreshed
-    first -- not the primary freshness mechanism (the block-watcher +
-    refresh queue is), just insurance against a missed/misparsed block.
-    Bounded per call so it never blocks other work indefinitely. One
-    account's failure must not abort the rest of the batch (or poison the
-    connection for the next sweep) -- see refresh_worker's own rollback
-    for why."""
-    symbols = await known_symbols(conn)
-    rows = await (await conn.execute(
-        "SELECT account FROM known_accounts ORDER BY refreshed_at "
-        "LIMIT %s", (config.SAFETY_NET_BATCH_SIZE,),
-    )).fetchall()
-    for row in rows:
-        try:
-            await refresh_account(conn, nodes, row["account"], symbols,
-                                  pace=config.REFRESH_PACE_SECONDS)
-        except Exception as exc:
-            logger.error("safety-net: %s failed: %r", row["account"], exc)
-            await conn.rollback()
-    return len(rows)
-
+# The hourly safety-net sweep was REMOVED (2026-07-17, founder decision):
+# with failed lookups durably re-enqueued (see _requeue_failed), staleness-
+# bounded read refreshes (api._ensure_known), name-agnostic trigger
+# scanning (catalog.touched_accounts), and the unrecognized-event alarm
+# (catalog._check_unknown_event), the sweep's only remaining job was
+# refreshing accounts nobody queries -- work with no beneficiary. All
+# correction now scales with actual usage and actual failures, never with
+# fleet size.
 
 # -- market -------------------------------------------------------------------
 

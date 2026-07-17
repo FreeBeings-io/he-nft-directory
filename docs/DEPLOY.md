@@ -9,8 +9,8 @@ Two processes against one database — no Hive L1 node needed:
 
 The sync process runs a block-watcher (walks HE blocks directly, queues
 touched accounts) and a refresh worker (re-fetches queued accounts'
-current holdings from HE), plus periodic catalog/market/safety-net sweeps
-— see `src/henftdir/service.py`.
+current holdings from HE, retrying failures durably with backoff), plus
+periodic catalog/market sweeps — see `src/henftdir/service.py`.
 
 Disk: `instances` only ever holds rows for accounts someone has actually
 queried, not the whole platform — this is a cache, not a full mirror. It
@@ -65,7 +65,9 @@ Notes:
   `HENFT_ACTIVITY_BACKFILL_BATCH` / `HENFT_ACTIVITY_BACKFILL_PAUSE`
   (activity-backfill pacing: blocks per burst / seconds between bursts,
   defaults 10 / 10.0 — tuned for shared public nodes; open the throttle
-  on a self-hosted node). API-only:
+  on a self-hosted node), `HENFT_ACCOUNT_STALE_AFTER` (seconds before a
+  cached account read triggers a background re-fetch, default 21600).
+  API-only:
   `WEB_CONCURRENCY` (gunicorn workers, default 2), `WEB_TIMEOUT` (gunicorn
   worker timeout in seconds, default 90 — a never-before-seen account's
   first query does a synchronous ~150-table cold-fetch before responding;

@@ -157,7 +157,7 @@ async def process_block(conn: psycopg.AsyncConnection, block: dict) -> int:
 async def process_block_capture_only(conn: psycopg.AsyncConnection, block: dict) -> int:
     """Backfill variant: record sales + events but queue NO refreshes --
     old blocks say nothing about *current* holdings (the live path and
-    safety-net own freshness), and queueing weeks of historical accounts
+    read-staleness refreshes own freshness), and queueing weeks of historical accounts
     would swamp the refresh worker for zero cache benefit. Returns the
     number of events recorded."""
     _, sales, events = parse_block(block)

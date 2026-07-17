@@ -2,8 +2,8 @@
 
 Runs the sync service: a block-watcher (queues accounts touched by HE
 nft/nftmarket transactions) and a refresh worker (re-fetches those
-accounts' current state directly from HE), plus periodic catalog/market/
-safety-net sweeps. No Hive L1 dependency -- see
+accounts' current state directly from HE, retrying failures durably with
+backoff), plus periodic catalog/market sweeps. No Hive L1 dependency -- see
 service.py's module docstring. The HTTP API is served separately:
 gunicorn 'henftdir.api:application' (HENFT_DSN).
 """

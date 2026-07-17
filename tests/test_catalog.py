@@ -96,3 +96,33 @@ def test_market_sales_ignores_non_buy_and_non_nftmarket():
 def test_market_sales_tolerates_malformed_logs():
     t = {"contract": "nftmarket", "action": "buy", "logs": "not json"}
     assert market_sales(t, 1, None) == []
+
+
+def test_unknown_nft_event_warns_once(caplog):
+    """An nft-contract event name the parser has never seen must surface a
+    warning (once per name) -- with no reconciliation sweep, this alarm is
+    the only signal that the HE contracts changed under us. Known admin
+    events and known activity events stay silent."""
+    import logging
+    from henftdir import catalog
+
+    catalog._warned_unknown_events.discard("somethingBrandNew")
+    novel = tx("alice", {}, events=[
+        {"contract": "nft", "event": "somethingBrandNew",
+         "data": {"account": "bob", "symbol": "STAR", "id": 1}},
+    ])
+    with caplog.at_level(logging.WARNING, logger="henftdir.catalog"):
+        catalog.nft_events(novel, 1, None)
+        catalog.nft_events(novel, 2, None)  # second sighting: no second warn
+    warns = [r for r in caplog.records if "somethingBrandNew" in r.getMessage()]
+    assert len(warns) == 1
+
+    caplog.clear()
+    known = tx("alice", {}, events=[
+        {"contract": "nft", "event": "setProperties", "data": {}},
+        {"contract": "nft", "event": "transfer",
+         "data": {"symbol": "STAR", "id": 1, "from": "a", "to": "b"}},
+    ])
+    with caplog.at_level(logging.WARNING, logger="henftdir.catalog"):
+        catalog.nft_events(known, 3, None)
+    assert not caplog.records
