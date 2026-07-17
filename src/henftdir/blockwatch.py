@@ -52,11 +52,35 @@ async def queue_refresh(
     if not pairs:
         return
     accounts, symbols = zip(*pairs)
+    # Only queue touches for accounts we already TRACK (someone queried them
+    # at least once). The cache is a read-through over accounts people ask
+    # about -- it does not discover new accounts from chain activity, so its
+    # size scales with usage, not with how busy Hive Engine is. A brand-new
+    # account is populated by the API cold-fetch, which marks it tracked
+    # BEFORE its scan, so any touch landing during that scan still matches
+    # this filter and is not lost.
     await conn.execute(
         "INSERT INTO refresh_queue (account, symbol) "
-        "SELECT * FROM unnest(%s::text[], %s::text[]) "
+        "SELECT a, s FROM unnest(%s::text[], %s::text[]) AS t(a, s) "
+        "WHERE EXISTS (SELECT 1 FROM known_accounts k WHERE k.account = t.a) "
         "ON CONFLICT (account, symbol) DO UPDATE SET queued_at = now()",
         (list(accounts), list(symbols)),
+    )
+
+
+async def queue_market_refresh(
+    conn: psycopg.AsyncConnection, symbols: set[str]
+) -> None:
+    """Mark symbols dirty for the market loop after a LIVE market event
+    (list/cancel/price-change/buy). The loop refreshes only these instead
+    of blindly re-polling every cached symbol's sellBook -- market work
+    then scales with trading activity, not symbol count."""
+    if not symbols:
+        return
+    await conn.execute(
+        "INSERT INTO market_refresh_queue (symbol) "
+        "SELECT unnest(%s::text[]) ON CONFLICT (symbol) DO UPDATE SET queued_at = now()",
+        (list(symbols),),
     )
 
 
@@ -151,6 +175,12 @@ async def process_block(conn: psycopg.AsyncConnection, block: dict) -> int:
     await queue_refresh(conn, pairs)
     await record_sales(conn, sales)
     await record_events(conn, events)
+    # Any symbol with a live market event this block is now stale on the
+    # order-book side -- flag it for the (event-driven) market loop.
+    await queue_market_refresh(conn, {
+        e["symbol"] for e in events
+        if e.get("symbol") and str(e.get("op", "")).startswith("market_")
+    })
     return len({acct for acct, _ in pairs})
 
 
@@ -179,7 +209,13 @@ async def run(app_dsn: str, nodes: HENodes, stop: asyncio.Event) -> None:
     elsewhere exhausting every node) crashed the entire sync service, not
     just this loop. Missing a block is the one failure this design can't
     route around later, so this is the one loop that must never let an
-    unhandled exception through."""
+    unhandled exception through.
+
+    The checkpoint advances ONLY after a block is actually processed: a
+    null result (a lagging node) or a processing error leaves last_he_block
+    where it is and retries, so the walk can never skip a block. Skipping is
+    the root failure -- every downstream cache gap traces back to an event
+    in an unprocessed block."""
     conn = await db.connect(app_dsn)
     try:
         row = await (await conn.execute(
@@ -198,11 +234,30 @@ async def run(app_dsn: str, nodes: HENodes, stop: asyncio.Event) -> None:
                     continue
                 next_block = last + 1
                 block = await nodes.get_block(next_block)
-                if block is not None:
-                    touched = await process_block(conn, block)
-                    if touched:
-                        logger.debug("HE block %d: queued %d account(s)",
-                                     next_block, touched)
+                if block is None:
+                    # next_block <= head (guarded above), so this block DOES
+                    # exist -- a node returned null because it's lagging
+                    # behind the head another node reported, NOT because the
+                    # block is absent. Advancing past it would SILENTLY skip
+                    # the block and every NFT event in it, forever: the one
+                    # failure this design cannot recover from, and the root
+                    # of any downstream cache gap. So do NOT advance -- retry
+                    # next cycle (node rotation tries a different node). A
+                    # genuinely stuck null surfaces as a stalled
+                    # last_he_block in /status: a visible halt, never a
+                    # silent skip. The brief idle avoids hot-looping a
+                    # lagging node during catch-up.
+                    logger.warning(
+                        "block_watcher: null for block %d (<= head %d) -- not "
+                        "advancing, retrying (lagging node?)", next_block, head)
+                    with contextlib.suppress(asyncio.TimeoutError):
+                        await asyncio.wait_for(
+                            stop.wait(), timeout=config.BLOCKWATCH_IDLE_SECONDS)
+                    continue
+                touched = await process_block(conn, block)
+                if touched:
+                    logger.debug("HE block %d: queued %d account(s)",
+                                 next_block, touched)
                 await conn.execute(
                     "INSERT INTO sync_state (name, last_he_block) VALUES "
                     "('block_watcher', %s) ON CONFLICT (name) DO UPDATE SET "
@@ -210,7 +265,7 @@ async def run(app_dsn: str, nodes: HENodes, stop: asyncio.Event) -> None:
                     (next_block,),
                 )
                 await conn.commit()
-                last = next_block  # avoid re-reading what we just wrote
+                last = next_block  # only after the block is actually processed
             except Exception as exc:
                 logger.error("block_watcher: %r", exc)
                 await conn.rollback()

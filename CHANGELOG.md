@@ -8,6 +8,53 @@ change); a history endpoint is deliberately not part of this design.
 
 ## [Unreleased]
 
+## [0.8.0] - 2026-07-17
+
+### Fixed
+- The block-watcher could **silently skip a block**: it advanced its
+  checkpoint even when a node returned null for a block that exists (a node
+  lagging behind the head another node reported), dropping every NFT event
+  in that block forever. The checkpoint now advances only after a block is
+  actually processed; a null (or a processing error) retries the same block
+  instead of skipping it. This is the root correctness guarantee — every
+  downstream cache gap traces back to an unprocessed block.
+- An account is now fully populated before it is ever served or refreshed
+  cheaply. Previously an account first seen via a block-watcher touch was
+  marked known after a single targeted collection check, so a read returned
+  incomplete holdings (anything acquired before we started watching was
+  invisible). Accounts now have two states — *tracked* (a row exists) and
+  *populated* (a full scan has completed, `populated_at` set) — and only a
+  full scan sets populated; the worker escalates a not-yet-populated account
+  to a full scan, and the API serves only populated accounts.
+
+### Changed
+- The cache is now strictly **read-through over queried accounts**. The
+  block-watcher queues refreshes only for tracked accounts (someone queried
+  them at least once), so cache size scales with usage, not chain activity —
+  matching the `/status` disclosure, which was previously aspirational. An
+  account is marked *tracked* at the start of its cold-fetch (before the
+  scan), so a block touching it DURING its initial scan is still queued and
+  refreshed rather than lost.
+- **Event-driven market refresh.** The market loop now refreshes only
+  symbols the block-watcher flags on a live market event
+  (list/cancel/price-change/buy), draining a `market_refresh_queue`, plus
+  a slow full-sweep backstop (default hourly) and one sweep at startup.
+  Steady-state market work scales with trading activity instead of
+  re-polling every cached symbol's full sellBook every 5 min.
+- **Payload-only refreshes are narrowed.** A refresh that names no symbol
+  (`setProperties`-shaped touches, staleness re-verifies) now re-checks
+  only the collections the account already holds instead of all ~115 known
+  symbols — ownership changes always arrive as symbol-naming (targeted)
+  events. Falls back to a full re-check for accounts with nothing cached.
+- **Short-TTL response cache** (30s) on `/collections` and `/market/*` —
+  their data only changes on the background refresh cycle, so this turns
+  the repeated full-payload rebuild into a cache hit.
+
+### Performance
+- Refresh-queue claim gained an index on `(not_before, queued_at)` so the
+  worker's every-poll filter doesn't scan accumulated retry-backoff rows.
+- `/collections` uses `EXISTS` instead of a per-row `count(*)` subquery.
+
 ## [0.7.0] - 2026-07-17
 
 ### Changed

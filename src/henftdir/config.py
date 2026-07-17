@@ -167,9 +167,17 @@ ACCOUNT_STALE_AFTER_SECONDS = _env_float("HENFT_ACCOUNT_STALE_AFTER", 21600.0)
 # refreshed often.
 CATALOG_INTERVAL_SECONDS = 300
 
-# Per-symbol sell-book mirror, for every symbol that has cached instances
-# (i.e. symbols someone has actually queried) -- not gated on a market flag.
-MARKET_INTERVAL_SECONDS = 300
+# Market loop cadence. Each cycle drains market_refresh_queue -- symbols the
+# block-watcher flagged dirty on a live market event -- which is cheap and
+# usually empty, so this polls more often than the old blind all-symbols
+# sweep did. Event-driven: steady-state market work now scales with trading
+# activity, not with how many symbols are cached.
+MARKET_INTERVAL_SECONDS = 60
+# Backstop full sweep of every cached symbol's sellBook, in case a market
+# event was ever missed. Rare relative to the dirty drain -- the whole point
+# of the event-driven path is to make this the exception, not the steady
+# state. Runs once at startup too (fresh process needs floors immediately).
+MARKET_FULL_SWEEP_SECONDS = 3600
 # 10 pages * 1000 keeps `offset` <= 9000, under HE's ~10k offset cap (it
 # returns 400 beyond that -- verified live). A sellBook larger than this
 # can't be fully paginated on public HE at all; refresh_market degrades to a

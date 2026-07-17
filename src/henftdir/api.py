@@ -49,6 +49,31 @@ _mappings_lock = threading.Lock()
 _mappings: dict | None = None
 _mappings_loaded_at = 0.0
 
+# Short-TTL response cache for read endpoints whose data only changes on the
+# background 5-min catalog/market refresh cycle (collections, market). At
+# worst a served response is TTL seconds staler than the refresh loops
+# already make it -- negligible, and it turns the repeated full-payload
+# rebuild (/collections is ~98KB with a per-row subquery) into a dict hit.
+_RESPONSE_CACHE_TTL = 30.0
+_response_cache: dict = {}
+_response_cache_lock = threading.Lock()
+
+
+def _cached(key, produce):
+    now = time.monotonic()
+    with _response_cache_lock:
+        hit = _response_cache.get(key)
+        if hit is not None and now - hit[0] < _RESPONSE_CACHE_TTL:
+            return hit[1]
+    # Produced outside the lock: a concurrent double-miss just recomputes an
+    # idempotent read, which is cheaper than serializing all readers.
+    value = produce()
+    with _response_cache_lock:
+        if len(_response_cache) > 512:  # bound key growth (cursors/accounts)
+            _response_cache.clear()
+        _response_cache[key] = (now, value)
+    return value
+
 
 def _conn():
     conn = getattr(_local, "conn", None)
@@ -73,25 +98,42 @@ def _q(sql: str, params: tuple = ()) -> list[dict]:
 async def _refresh_account_locked(
     conn, nodes: HENodes, account: str, symbols: list[str],
 ) -> None:
-    """Acquire a per-account advisory lock before refreshing -- without
-    this, two concurrent requests for the same never-before-seen account
-    (two gunicorn workers, two users checking the same account at once)
-    would each pay for their own full ~150-table cold-fetch burst against
-    HE at the same time, doubling exactly the kind of load this session
-    has spent most of today trying to keep polite. Transaction-scoped:
-    released automatically when refresh_account's own commit happens on
-    this connection. Re-checks known_accounts after acquiring the lock,
-    since the other request may have already finished the work."""
+    """Cold-fetch an account's first full population, under a per-account
+    advisory lock so two concurrent requests for the same never-before-seen
+    account don't each pay for their own ~150-table burst against HE.
+
+    The lock is SESSION-scoped (not transaction-scoped) because we commit
+    mid-way: the account is marked TRACKED (a known_accounts row with
+    populated_at NULL) and committed BEFORE the scan, so any block-watcher
+    touch landing during the scan matches the tracked-only queue filter and
+    is refreshed afterward rather than lost. The scan then sets populated_at
+    at its own commit. Re-checks populated_at after acquiring the lock,
+    since another request may have finished while we waited."""
     await conn.execute(
-        "SELECT pg_advisory_xact_lock(%s, hashtext(%s))",
+        "SELECT pg_advisory_lock(%s, hashtext(%s))",
         (_COLD_FETCH_LOCK_NAMESPACE, account),
     )
-    row = await (await conn.execute(
-        "SELECT 1 FROM known_accounts WHERE account = %s", (account,)
-    )).fetchone()
-    if row is not None:
-        return  # someone else already finished this while we waited
-    await sync.refresh_account(conn, nodes, account, symbols)
+    try:
+        row = await (await conn.execute(
+            "SELECT populated_at FROM known_accounts WHERE account = %s", (account,)
+        )).fetchone()
+        if row is not None and row["populated_at"] is not None:
+            return  # someone else fully populated it while we waited
+        # Mark tracked + commit so the block-watcher starts queueing touches
+        # for this account NOW -- closing the window where a block arriving
+        # mid-scan would be dropped by the tracked-only filter.
+        await conn.execute(
+            "INSERT INTO known_accounts (account) VALUES (%s) "
+            "ON CONFLICT (account) DO NOTHING", (account,),
+        )
+        await conn.commit()
+        await sync.refresh_account(conn, nodes, account, symbols)  # sets populated_at
+    finally:
+        await conn.execute(
+            "SELECT pg_advisory_unlock(%s, hashtext(%s))",
+            (_COLD_FETCH_LOCK_NAMESPACE, account),
+        )
+        await conn.commit()
 
 
 async def _cold_fetch_account(account: str) -> None:
@@ -133,11 +175,15 @@ def _ensure_known(account: str) -> None:
     safety-net sweep). See sync.py's module docstring for why a
     per-account refresh is fast regardless of collection size."""
     row = _q(
-        "SELECT refreshed_at < now() - make_interval(secs => %s) AS stale "
+        "SELECT populated_at IS NULL AS unpopulated, "
+        "refreshed_at < now() - make_interval(secs => %s) AS stale "
         "FROM known_accounts WHERE account = %s",
         (config.ACCOUNT_STALE_AFTER_SECONDS, account),
     )
-    if not row:
+    # No row, or tracked-but-not-yet-fully-scanned -> populate synchronously
+    # now (the cold-fetch is idempotent + advisory-locked, so a mid-scan
+    # concurrent request just waits on the lock and then finds it populated).
+    if not row or row[0]["unpopulated"]:
         asyncio.run(_cold_fetch_account(account))
     elif row[0]["stale"]:
         _enqueue_stale_refresh(account)
@@ -268,13 +314,19 @@ def account_nfts(params: dict, account: str) -> dict:
 
 
 def collections_list(params: dict) -> dict:
-    cursor, limit = _page(params)
+    _, limit = _page(params)
+    cursor_symbol = params.get("cursor_symbol", "")
+    return _cached(("collections", cursor_symbol, limit),
+                   lambda: _collections_list(cursor_symbol, limit))
+
+
+def _collections_list(cursor_symbol: str, limit: int) -> dict:
     rows = _q(
         "SELECT c.*, "
-        "(SELECT count(*) FROM display_mappings m WHERE m.symbol = c.symbol) > 0 "
+        "EXISTS (SELECT 1 FROM display_mappings m WHERE m.symbol = c.symbol) "
         "  AS has_display_mapping "
         "FROM collections c WHERE c.symbol > %s ORDER BY c.symbol LIMIT %s",
-        (params.get("cursor_symbol", ""), limit),
+        (cursor_symbol, limit),
     )
     for row in rows:
         if row["supply"] is not None and row["circulating_supply"] is not None:
@@ -332,11 +384,17 @@ def nft_detail(params: dict, symbol: str, nft_id: str) -> dict | None:
 
 
 def market(params: dict, symbol: str) -> dict:
-    where, args = "symbol = %s", [symbol]
-    if params.get("account"):
-        where += " AND account = %s"
-        args.append(params["account"])
     cursor, limit = _page(params)
+    account = params.get("account") or ""
+    return _cached(("market", symbol, account, cursor, limit),
+                   lambda: _market(symbol, account, cursor, limit))
+
+
+def _market(symbol: str, account: str, cursor: int, limit: int) -> dict:
+    where, args = "symbol = %s", [symbol]
+    if account:
+        where += " AND account = %s"
+        args.append(account)
     orders = _q(
         f"SELECT nft_id, account, owned_by, price, price_symbol, fee, ts "
         f"FROM market_orders WHERE {where} AND nft_id > %s "

@@ -755,3 +755,149 @@ async def test_refresh_worker_drains_accounts_concurrently():
         assert left["n"] == 0
     finally:
         await conn.close()
+
+
+async def test_refresh_dirty_markets_drains_queue():
+    """Event-driven market refresh: only symbols flagged in
+    market_refresh_queue are refreshed, and each is removed once done."""
+    conn = await fresh_conn("sync_dirtymkt")
+    try:
+        await conn.execute("INSERT INTO collections (symbol) VALUES ('CARD')")
+        await conn.execute("INSERT INTO market_refresh_queue (symbol) VALUES ('CARD')")
+        await conn.commit()
+        nodes = FakeNodes({("nftmarket", "CARDsellBook"): [[
+            {"nftId": 1, "account": "alice", "ownedBy": "u", "price": "5",
+             "priceSymbol": "SWAP.HIVE", "timestamp": 1700000000000, "grouping": {}}]]})
+        n = await sync.refresh_dirty_markets(conn, nodes)
+        assert n == 1
+        left = await (await conn.execute(
+            "SELECT count(*) AS n FROM market_refresh_queue")).fetchone()
+        assert left["n"] == 0
+        orders = await (await conn.execute(
+            "SELECT symbol, nft_id FROM market_orders")).fetchall()
+        assert [(o["symbol"], o["nft_id"]) for o in orders] == [("CARD", 1)]
+    finally:
+        await conn.close()
+
+
+async def test_full_refresh_narrows_to_cached_symbols():
+    """A '' (payload-only / staleness) refresh re-checks only collections
+    the account already holds -- acquisitions arrive as targeted events,
+    never as ''. Here alice holds only CARD, so OTHER/EXTRA are NOT queried."""
+    conn = await fresh_conn("sync_narrow")
+    try:
+        await conn.execute(
+            "INSERT INTO collections (symbol) VALUES ('CARD'), ('OTHER'), ('EXTRA')")
+        await conn.execute(
+            "INSERT INTO known_accounts (account, populated_at) VALUES ('alice', now())")
+        await conn.execute(
+            "INSERT INTO instances (symbol, nft_id, account, owned_by) "
+            "VALUES ('CARD', 1, 'alice', 'u')")
+        await conn.commit()
+        nodes = FakeNodes({("nft", "CARDinstances"): [[
+            {"_id": 1, "account": "alice", "ownedBy": "u", "properties": {}}]]})
+        all_syms = await sync.known_symbols(conn)
+        await sync._refresh_one(conn, nodes, "alice", [""], all_syms)
+        assert sorted({t[1] for t in nodes.calls}) == ["CARDinstances"]
+    finally:
+        await conn.close()
+
+
+async def test_full_refresh_falls_back_to_all_symbols_when_nothing_cached():
+    """A '' refresh for an account with no cached holdings (unknown /
+    holds-nothing) falls back to a full re-check over all known symbols --
+    the cold-fetch-equivalent path."""
+    conn = await fresh_conn("sync_narrowfallback")
+    try:
+        await conn.execute("INSERT INTO collections (symbol) VALUES ('CARD'), ('OTHER')")
+        await conn.execute(
+            "INSERT INTO known_accounts (account, populated_at) VALUES ('newbie', now())")
+        await conn.commit()
+        nodes = FakeNodes({})  # all empty
+        all_syms = await sync.known_symbols(conn)
+        await sync._refresh_one(conn, nodes, "newbie", [""], all_syms)
+        assert sorted({t[1] for t in nodes.calls}) == ["CARDinstances", "OTHERinstances"]
+    finally:
+        await conn.close()
+
+
+async def test_dirty_market_survives_concurrent_reflag(monkeypatch):
+    """If a new market event re-flags a symbol WHILE it's being refreshed,
+    the queued_at guard must keep the row so the loop re-refreshes next
+    cycle -- an unconditional delete would drop that event's book change
+    until the hourly full sweep."""
+    conn = await fresh_conn("sync_mktrace")
+    try:
+        await conn.execute("INSERT INTO collections (symbol) VALUES ('CARD')")
+        await conn.execute(
+            "INSERT INTO market_refresh_queue (symbol, queued_at) "
+            "VALUES ('CARD', now() - interval '1 minute')")
+        await conn.commit()
+
+        real_refresh_market = sync.refresh_market
+
+        async def bumping_refresh_market(c, n, sym):
+            await real_refresh_market(c, n, sym)  # commits the book
+            # a concurrent block-watcher re-flags CARD (a new market event)
+            await c.execute(
+                "INSERT INTO market_refresh_queue (symbol) VALUES (%s) "
+                "ON CONFLICT (symbol) DO UPDATE SET queued_at = now()", (sym,))
+            await c.commit()
+
+        monkeypatch.setattr(sync, "refresh_market", bumping_refresh_market)
+        nodes = FakeNodes({("nftmarket", "CARDsellBook"): [[]]})
+        await sync.refresh_dirty_markets(conn, nodes)
+        left = await (await conn.execute(
+            "SELECT count(*) AS n FROM market_refresh_queue WHERE symbol='CARD'")).fetchone()
+        assert left["n"] == 1  # re-flag survived the delete guard
+    finally:
+        await conn.close()
+
+
+async def test_worker_full_scans_a_touch_first_account():
+    """An account first seen via a block-watcher TOUCH (targeted, one
+    symbol) must get a FULL scan before being marked known -- otherwise a
+    read would show only the touched collection and miss holdings acquired
+    before we started watching. No account may be marked known on a partial
+    check."""
+    conn = await fresh_conn("sync_touchfirst")
+    try:
+        await conn.execute("INSERT INTO collections (symbol) VALUES ('CARD'), ('OTHER')")
+        await conn.commit()
+        nodes = FakeNodes({
+            ("nft", "CARDinstances"): [[{"_id": 1, "account": "newacct",
+                                         "ownedBy": "u", "properties": {}}]],
+            ("nft", "OTHERinstances"): [[{"_id": 2, "account": "newacct",
+                                          "ownedBy": "u", "properties": {}}]],
+        })
+        all_syms = await sync.known_symbols(conn)
+        # a targeted touch for a brand-new (unknown) account
+        await sync._refresh_one(conn, nodes, "newacct", ["CARD"], all_syms)
+        # escalated: BOTH collections checked, not just the touched one
+        assert sorted({t[1] for t in nodes.calls}) == ["CARDinstances", "OTHERinstances"]
+        known = await (await conn.execute(
+            "SELECT 1 FROM known_accounts WHERE account = 'newacct'")).fetchone()
+        assert known is not None  # marked known only after the full scan
+    finally:
+        await conn.close()
+
+
+async def test_worker_stays_targeted_for_already_known_account():
+    """An account that has ALREADY had its full scan (is known) takes the
+    cheap targeted path on a touch -- only the touched collection, not all."""
+    conn = await fresh_conn("sync_knowntargeted")
+    try:
+        await conn.execute("INSERT INTO collections (symbol) VALUES ('CARD'), ('OTHER')")
+        await conn.execute(
+            "INSERT INTO known_accounts (account, populated_at) VALUES ('alice', now())")
+        await conn.execute(
+            "INSERT INTO instances (symbol, nft_id, account, owned_by) "
+            "VALUES ('CARD', 1, 'alice', 'u')")
+        await conn.commit()
+        nodes = FakeNodes({("nft", "CARDinstances"): [[
+            {"_id": 1, "account": "alice", "ownedBy": "u", "properties": {}}]]})
+        all_syms = await sync.known_symbols(conn)
+        await sync._refresh_one(conn, nodes, "alice", ["CARD"], all_syms)
+        assert sorted({t[1] for t in nodes.calls}) == ["CARDinstances"]  # targeted only
+    finally:
+        await conn.close()

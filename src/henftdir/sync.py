@@ -297,12 +297,18 @@ async def refresh_account(
     # bumping the clock would mean an active account never trips its
     # periodic full re-check while its untouched symbols drift.
     if dequeue_symbols is None:
+        # Full pass: mark populated_at too -- this is the scan that makes an
+        # account safe to serve and eligible for the cheap targeted paths.
         await conn.execute(
-            "INSERT INTO known_accounts (account) VALUES (%s) "
-            "ON CONFLICT (account) DO UPDATE SET refreshed_at = now()",
+            "INSERT INTO known_accounts (account, populated_at) VALUES (%s, now()) "
+            "ON CONFLICT (account) DO UPDATE SET refreshed_at = now(), "
+            "populated_at = now()",
             (account,),
         )
     else:
+        # Targeted pass: never creates or populates an account (a partial
+        # check must not make an account look complete). It only runs for
+        # accounts already tracked+populated, so DO NOTHING is right.
         await conn.execute(
             "INSERT INTO known_accounts (account) VALUES (%s) "
             "ON CONFLICT (account) DO NOTHING", (account,),
@@ -345,20 +351,59 @@ async def _reschedule_account(conn: psycopg.AsyncConnection, account: str) -> No
     await conn.commit()
 
 
+async def _cached_account_symbols(
+    conn: psycopg.AsyncConnection, account: str
+) -> list[str]:
+    """Symbols the account currently has cached holdings in -- owned or
+    delegated-in. Uses instances_account_idx / instances_delegated_idx."""
+    rows = await (await conn.execute(
+        "SELECT symbol FROM instances WHERE account = %s "
+        "UNION SELECT symbol FROM instances WHERE delegated_to = %s",
+        (account, account),
+    )).fetchall()
+    return [r["symbol"] for r in rows]
+
+
 async def _refresh_one(
     conn: psycopg.AsyncConnection, nodes: HENodes, account: str,
     syms: list[str], all_symbols: list[str],
 ) -> None:
     """Refresh one claimed account on its OWN connection, so a batch of
     accounts refreshes concurrently and one account's failure (or its
-    connection's rollback) can never touch another's transaction. A ''
-    entry means a touch couldn't be attributed to a symbol -> full
-    refresh; otherwise re-check only the touched collections (~40x cheaper)
-    and dequeue exactly those rows so touches arriving mid-refresh aren't
-    lost."""
+    connection's rollback) can never touch another's transaction.
+
+    A non-empty symbol list is a TARGETED re-check of just the touched
+    collections (~40x cheaper), dequeuing exactly those rows so touches
+    arriving mid-refresh aren't lost.
+
+    A '' entry is a touch that named no symbol -- a payload-only action
+    (setProperties etc.) or a staleness re-verify. Those never transfer
+    ownership: a genuine acquisition always emits a symbol-naming event and
+    so refreshes targeted, never via ''. So a '' refresh re-checks only the
+    collections the account ALREADY holds, not all ~115 known symbols --
+    falling back to a full re-check when nothing is cached (unknown /
+    holds-nothing account, effectively a cold fetch). NOTE: this narrows
+    missed-block recovery -- a new-collection acquisition during a
+    block-watcher gap is caught only by a later targeted event, not by a ''
+    refresh; consistent with the watcher-completeness bet that also retired
+    the safety-net sweep."""
     try:
-        if "" in syms:
+        row = await (await conn.execute(
+            "SELECT populated_at FROM known_accounts WHERE account = %s", (account,)
+        )).fetchone()
+        if row is None or row["populated_at"] is None:
+            # Not yet fully populated -- either a touch arrived for an
+            # account still mid-initial-scan (tracked, populated_at NULL), or
+            # a row we somehow haven't scanned. Do a FULL scan so it's
+            # completely populated before it is ever served, and so the ''
+            # narrowing below only ever applies to already-fully-scanned
+            # accounts. (The API cold-fetch normally does this first; this is
+            # the belt-and-suspenders path for the touch-driven case.)
             await refresh_account(conn, nodes, account, all_symbols,
+                                  pace=config.REFRESH_PACE_SECONDS)
+        elif "" in syms:
+            cached = await _cached_account_symbols(conn, account)
+            await refresh_account(conn, nodes, account, cached or all_symbols,
                                   pace=config.REFRESH_PACE_SECONDS)
         else:
             await refresh_account(conn, nodes, account, syms,
@@ -532,6 +577,37 @@ async def refresh_market(
     )
     await conn.commit()
     return len(orders)
+
+
+async def refresh_dirty_markets(conn: psycopg.AsyncConnection, nodes: HENodes) -> int:
+    """Refresh only the symbols the block-watcher flagged dirty (a live
+    market event landed), draining market_refresh_queue. Event-driven, so
+    steady-state market work scales with trading activity instead of
+    re-polling every cached symbol's full sellBook on a blind timer. A
+    slow full sweep (refresh_all_markets) still runs as a backstop for
+    anything a missed event would leave stale. One symbol's failure leaves
+    it queued (rolled back, not deleted) for the next cycle."""
+    rows = await (await conn.execute(
+        "SELECT symbol, queued_at FROM market_refresh_queue ORDER BY queued_at"
+    )).fetchall()
+    await conn.rollback()  # release the read snapshot (autocommit=False)
+    for row in rows:
+        try:
+            await refresh_market(conn, nodes, row["symbol"])  # commits on success
+            # Delete only if NO newer market event re-flagged this symbol
+            # while we were refreshing -- an unconditional delete would drop
+            # that event's book change until the hourly full sweep. A newer
+            # event's ON CONFLICT bumps queued_at, so this leaves the row for
+            # the next cycle.
+            await conn.execute(
+                "DELETE FROM market_refresh_queue "
+                "WHERE symbol = %s AND queued_at <= %s",
+                (row["symbol"], row["queued_at"]))
+            await conn.commit()
+        except Exception as exc:
+            logger.warning("refresh_dirty_markets(%s) failed: %r", row["symbol"], exc)
+            await conn.rollback()  # symbol stays queued -> retried next cycle
+    return len(rows)
 
 
 async def refresh_all_markets(conn: psycopg.AsyncConnection, nodes: HENodes) -> None:
