@@ -23,6 +23,14 @@ pytestmark = pytest.mark.skipif(
 SCHEMA = "api_test"
 
 
+@pytest.fixture(autouse=True)
+def _clear_response_cache():
+    # the endpoint response cache is a module global -- clear it between
+    # tests so a cached payload can't leak across cases.
+    api_mod._response_cache.clear()
+    yield
+
+
 @pytest.fixture(scope="module", autouse=True)
 async def seeded():
     admin = await db.connect(TEST_DSN)
@@ -38,7 +46,8 @@ async def seeded():
         "market_enabled) VALUES ('CARD', 'Card Game', 2, 1, true)"
     )
     await conn.execute(
-        "INSERT INTO known_accounts (account) VALUES ('carol'), ('bob'), ('nftmarket')"
+        "INSERT INTO known_accounts (account, populated_at) VALUES "
+        "('carol', now()), ('bob', now()), ('nftmarket', now())"
     )
     await conn.execute(
         "INSERT INTO instances (symbol, nft_id, account, owned_by, properties) "
@@ -114,7 +123,8 @@ async def _fake_cold_fetch_account(account: str) -> None:
     conn = await db.connect(api_mod.DSN)
     try:
         await conn.execute(
-            "INSERT INTO known_accounts (account) VALUES (%s)", (account,)
+            "INSERT INTO known_accounts (account, populated_at) VALUES (%s, now())",
+            (account,),
         )
         await conn.execute(
             "INSERT INTO instances (symbol, nft_id, account, owned_by, properties) "
@@ -210,8 +220,8 @@ async def test_refresh_account_locked_skips_when_already_known(monkeypatch):
     conn = await db.connect(api_mod.DSN)
     try:
         await conn.execute(
-            "INSERT INTO known_accounts (account) VALUES ('alreadyknown') "
-            "ON CONFLICT (account) DO NOTHING"
+            "INSERT INTO known_accounts (account, populated_at) "
+            "VALUES ('alreadyknown', now()) ON CONFLICT (account) DO NOTHING"
         )
         await conn.commit()
 

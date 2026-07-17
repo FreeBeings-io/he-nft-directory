@@ -51,6 +51,7 @@ import asyncio
 import contextlib
 import logging
 import signal
+import time
 
 from . import blockwatch, config, db, sync
 from .henodes import HENodes
@@ -88,9 +89,19 @@ class Service:
         setup = await db.connect(self.app_dsn)
         await db.apply_schema(setup)
         for account in _ALWAYS_KNOWN_ACCOUNTS:
+            # Seed as tracked, and queue a full refresh so the worker
+            # actually populates it (populated_at stays NULL until a full
+            # scan runs -- these accounts aren't API-queried, so nothing else
+            # would trigger it, and the escrow account must be populated for
+            # the listed-NFT join to resolve). The worker escalates a
+            # not-yet-populated account to a full scan.
             await setup.execute(
                 "INSERT INTO known_accounts (account) VALUES (%s) "
                 "ON CONFLICT (account) DO NOTHING", (account,),
+            )
+            await setup.execute(
+                "INSERT INTO refresh_queue (account, symbol) VALUES (%s, '') "
+                "ON CONFLICT (account, symbol) DO NOTHING", (account,),
             )
         await setup.commit()
         await setup.close()
@@ -151,11 +162,23 @@ class Service:
             await conn.close()
 
     async def _market_loop(self, nodes: HENodes) -> None:
+        # Event-driven: each cycle drains only symbols the block-watcher
+        # flagged dirty (cheap, usually empty). A full sweep runs on startup
+        # (last_full = 0.0 -> due immediately, so a fresh process has floors)
+        # and then only every MARKET_FULL_SWEEP_SECONDS as a backstop against
+        # anything a missed market event would leave stale.
         conn = await db.connect(self.app_dsn)
+        last_full = 0.0
         try:
             while not self.stop.is_set():
                 try:
-                    await sync.refresh_all_markets(conn, nodes)
+                    n = await sync.refresh_dirty_markets(conn, nodes)
+                    if n:
+                        logger.info("market refresh: %d dirty symbol(s)", n)
+                    now = time.monotonic()
+                    if now - last_full >= config.MARKET_FULL_SWEEP_SECONDS:
+                        await sync.refresh_all_markets(conn, nodes)
+                        last_full = now
                 except Exception as exc:
                     logger.error("market refresh failed: %r", exc)
                     await conn.rollback()

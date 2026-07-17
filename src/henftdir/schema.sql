@@ -35,11 +35,27 @@ CREATE TABLE IF NOT EXISTS collections (
 -- populated on first query, never eagerly. This IS the cache boundary: an
 -- account not in this table has never been looked up, and its holdings
 -- (if any) are not mirrored anywhere below.
+-- An account has two states. A row here means TRACKED: the block-watcher
+-- queues its touches to keep it fresh (the cache follows only accounts
+-- someone has actually queried -- see the disclosure in api.status). Rows
+-- are created by the API cold-fetch; the block-watcher never creates them,
+-- so activity for never-queried accounts is ignored, and cache size scales
+-- with usage, not chain activity.
+--   populated_at IS NULL  -> tracked, but the initial full scan hasn't
+--     finished yet (set at cold-fetch start so touches landing DURING the
+--     scan are queued and not lost). NOT served by the API.
+--   populated_at set      -> a full scan has completed at least once; safe
+--     to serve, and eligible for the cheap targeted/narrowed refresh paths.
 CREATE TABLE IF NOT EXISTS known_accounts (
     account       text PRIMARY KEY,
     first_seen_at timestamptz NOT NULL DEFAULT now(),
-    refreshed_at  timestamptz NOT NULL DEFAULT now()
+    refreshed_at  timestamptz NOT NULL DEFAULT now(),
+    populated_at  timestamptz
 );
+-- migrate a pre-two-state deployment: existing rows were populated under the
+-- old model, so treat them as populated.
+ALTER TABLE known_accounts ADD COLUMN IF NOT EXISTS populated_at timestamptz;
+UPDATE known_accounts SET populated_at = refreshed_at WHERE populated_at IS NULL;
 -- refreshed_at = last FULL refresh pass (targeted single-symbol
 -- re-checks deliberately don't bump it -- it's what the read-staleness
 -- bound measures against). The index's original consumer (the safety-net
@@ -79,6 +95,12 @@ CREATE TABLE IF NOT EXISTS refresh_queue (
 -- refresh_worker orders by this on every poll.
 CREATE INDEX IF NOT EXISTS refresh_queue_queued_at_idx
     ON refresh_queue (queued_at);
+-- The worker's claim filters `not_before <= now()` every poll; since the
+-- queue doubles as the retry ledger, backoff rows accumulate here, and
+-- without this index that filter scans them all during a large retry
+-- backlog (exactly when the service is already under upstream stress).
+CREATE INDEX IF NOT EXISTS refresh_queue_not_before_idx
+    ON refresh_queue (not_before, queued_at);
 -- migrate a pre-retry-ledger deployment in place
 ALTER TABLE refresh_queue ADD COLUMN IF NOT EXISTS attempts int NOT NULL DEFAULT 0;
 ALTER TABLE refresh_queue ADD COLUMN IF NOT EXISTS not_before timestamptz NOT NULL DEFAULT now();
@@ -138,6 +160,17 @@ CREATE TABLE IF NOT EXISTS market_orders (
     PRIMARY KEY (symbol, nft_id)
 );
 CREATE INDEX IF NOT EXISTS market_orders_account_idx ON market_orders (account);
+
+-- Event-driven market refresh: the block-watcher inserts a symbol here when
+-- it sees a market event for it (list/cancel/price-change/buy), and the
+-- market loop refreshes only these dirty symbols each cycle instead of
+-- re-polling every cached symbol's full sellBook on a blind timer. Market
+-- work then scales with actual trading activity, not with symbol count. A
+-- slow full sweep still runs as a backstop (see service._market_loop).
+CREATE TABLE IF NOT EXISTS market_refresh_queue (
+    symbol      text PRIMARY KEY,
+    queued_at   timestamptz NOT NULL DEFAULT now()
+);
 
 -- Market rollups computed from market_orders on each market refresh: floor
 -- price per (payment token, group) and open-order count. grouping_key is

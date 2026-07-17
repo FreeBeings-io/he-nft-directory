@@ -27,6 +27,16 @@ async def fresh_conn(schema: str):
     return conn
 
 
+async def track(conn, *accounts):
+    """Mark accounts as tracked+populated (as if queried once) so the
+    block-watcher's known-only queue filter accepts their touches."""
+    for a in accounts:
+        await conn.execute(
+            "INSERT INTO known_accounts (account, populated_at) VALUES (%s, now()) "
+            "ON CONFLICT (account) DO UPDATE SET populated_at = now()", (a,))
+    await conn.commit()
+
+
 def tx(contract, sender, action="x", payload=None, events=None):
     logs = {"events": events} if events else {}
     return {"contract": contract, "action": action, "sender": sender,
@@ -36,6 +46,7 @@ def tx(contract, sender, action="x", payload=None, events=None):
 async def test_process_block_queues_only_nft_contract_accounts():
     conn = await fresh_conn("bw_filter")
     try:
+        await track(conn, "alice", "bob")
         block = {"transactions": [
             tx("nft", "alice"),
             tx("tokens", "eve"),   # not nft/nftmarket -- ignored
@@ -98,6 +109,7 @@ async def test_record_sales_is_idempotent_on_reprocess():
 async def test_queue_refresh_dedupes():
     conn = await fresh_conn("bw_dedupe")
     try:
+        await track(conn, "alice", "bob")
         await blockwatch.queue_refresh(conn, {("alice", "")})
         await blockwatch.queue_refresh(conn, {("alice", ""), ("bob", "STAR")})
         await conn.commit()
@@ -116,6 +128,7 @@ async def test_process_block_queues_targeted_pairs():
     full refresh."""
     conn = await fresh_conn("bw_targeted")
     try:
+        await track(conn, "alice", "bob")
         block = {"blockNumber": 5, "timestamp": "2026-07-11T00:00:00",
                  "transactions": [tx("nft", "alice", action="transfer", events=[{
                      "contract": "nft", "event": "transfer",
@@ -154,6 +167,7 @@ async def test_run_catches_up_sequentially_from_checkpoint():
             "INSERT INTO sync_state (name, last_he_block) VALUES ('block_watcher', 100)"
         )
         await conn.commit()
+        await track(conn, "alice", "bob")
         blocks = {
             101: {"transactions": [tx("nft", "alice")]},
             102: {"transactions": [tx("nftmarket", "bob")]},
@@ -219,6 +233,7 @@ async def test_run_recovers_from_a_transient_failure_without_crashing(monkeypatc
             "INSERT INTO sync_state (name, last_he_block) VALUES ('block_watcher', 100)"
         )
         await conn.commit()
+        await track(conn, "alice", "bob")
         blocks = {
             101: {"transactions": [tx("nft", "alice")]},
             102: {"transactions": []},
@@ -271,5 +286,146 @@ async def test_run_starts_from_current_tip_when_no_checkpoint():
             stop_soon(),
         )
         assert nodes.requested == [500]
+    finally:
+        await conn.close()
+
+
+async def test_process_block_flags_market_symbols_dirty():
+    """A live market event marks its symbol dirty for the event-driven
+    market loop; a plain (non-market) transfer does not."""
+    conn = await fresh_conn("bw_market")
+    try:
+        block = {"blockNumber": 100, "timestamp": "2026-07-17T00:00:00",
+                 "transactions": [
+            tx("nftmarket", "alice", action="sell", events=[
+                {"contract": "nftmarket", "event": "sellOrder",
+                 "data": {"symbol": "CARD", "id": 1, "account": "alice",
+                          "price": "10", "priceSymbol": "SWAP.HIVE"}}]),
+            tx("nft", "bob", action="transfer", events=[
+                {"contract": "nft", "event": "transfer",
+                 "data": {"symbol": "STAR", "id": 2, "from": "bob", "to": "carol"}}]),
+        ]}
+        await blockwatch.process_block(conn, block)
+        await conn.commit()
+        rows = await (await conn.execute(
+            "SELECT symbol FROM market_refresh_queue ORDER BY symbol")).fetchall()
+        assert [r["symbol"] for r in rows] == ["CARD"]  # STAR transfer isn't a market event
+    finally:
+        await conn.close()
+
+
+async def test_capture_only_does_not_flag_markets():
+    """Backfill (historical) blocks must not dirty the CURRENT market --
+    old order-book events say nothing about the present sellBook."""
+    conn = await fresh_conn("bw_market_capture")
+    try:
+        block = {"blockNumber": 101, "timestamp": "2026-07-17T00:00:00",
+                 "transactions": [
+            tx("nftmarket", "alice", action="sell", events=[
+                {"contract": "nftmarket", "event": "sellOrder",
+                 "data": {"symbol": "CARD", "id": 1, "account": "alice",
+                          "price": "10", "priceSymbol": "SWAP.HIVE"}}]),
+        ]}
+        await blockwatch.process_block_capture_only(conn, block)
+        await conn.commit()
+        rows = await (await conn.execute(
+            "SELECT count(*) AS n FROM market_refresh_queue")).fetchone()
+        assert rows["n"] == 0
+    finally:
+        await conn.close()
+
+
+class LaggingFakeNodes:
+    """get_block returns None for a block on its FIRST request (a node
+    lagging behind the reported head), then the real block on retry. The
+    watcher must never skip it."""
+
+    def __init__(self, head: int, blocks: dict[int, dict], null_block: int):
+        self.head = head
+        self.blocks = blocks
+        self.null_block = null_block
+        self.nulled_once = False
+        self.requested: list[int] = []
+
+    async def get_latest_block(self):
+        return {"blockNumber": self.head}
+
+    async def get_block(self, n: int):
+        self.requested.append(n)
+        if n == self.null_block and not self.nulled_once:
+            self.nulled_once = True
+            return None  # lagging node: block exists but this node lacks it
+        return self.blocks.get(n)
+
+
+async def test_run_never_skips_a_null_block(monkeypatch):
+    """A null result for a block that exists (next_block <= head) must NOT
+    advance the checkpoint -- the block is retried, never skipped. Skipping
+    would silently drop every NFT event in it, the root of any cache gap."""
+    monkeypatch.setattr(config, "BLOCKWATCH_IDLE_SECONDS", 0.01)
+    schema = "bw_null"
+    conn = await fresh_conn(schema)
+    try:
+        await conn.execute(
+            "INSERT INTO sync_state (name, last_he_block) VALUES ('block_watcher', 100)"
+        )
+        await conn.commit()
+        await track(conn, "alice", "bob")
+        blocks = {
+            101: {"transactions": [tx("nft", "alice")]},
+            102: {"transactions": [tx("nftmarket", "bob")]},
+        }
+        nodes = LaggingFakeNodes(head=102, blocks=blocks, null_block=101)
+        stop = asyncio.Event()
+
+        async def stop_once_caught_up():
+            for _ in range(300):
+                row = await (await conn.execute(
+                    "SELECT last_he_block FROM sync_state WHERE name='block_watcher'"
+                )).fetchone()
+                if row and row["last_he_block"] == 102:
+                    break
+                await asyncio.sleep(0.01)
+            stop.set()
+
+        await asyncio.gather(
+            blockwatch.run(f"{TEST_DSN} options='-c search_path={schema}'", nodes, stop),
+            stop_once_caught_up(),
+        )
+        # 101 nulled once then retried -- not skipped past.
+        assert nodes.requested.count(101) >= 2
+        row = await (await conn.execute(
+            "SELECT last_he_block FROM sync_state WHERE name='block_watcher'"
+        )).fetchone()
+        assert row["last_he_block"] == 102
+        # BOTH blocks' events captured -- 101 was processed, not skipped.
+        queued = await (await conn.execute(
+            "SELECT account FROM refresh_queue ORDER BY account")).fetchall()
+        assert [r["account"] for r in queued] == ["alice", "bob"]
+    finally:
+        await conn.close()
+
+
+async def test_queue_refresh_filters_to_tracked_accounts():
+    """The block-watcher queues touches only for TRACKED accounts (a row in
+    known_accounts). Two consequences it must get right:
+      - an account mid-initial-scan is already tracked (populated_at NULL),
+        so a touch landing DURING its cold-fetch is still queued -> not lost;
+      - a never-queried 'stranger' account's touch is ignored -> the cache
+        doesn't grow with chain activity for accounts nobody asked about."""
+    conn = await fresh_conn("bw_trackfilter")
+    try:
+        # tracked, cold-fetch in progress (populated_at NULL)
+        await conn.execute("INSERT INTO known_accounts (account) VALUES ('scanning')")
+        # tracked + fully populated
+        await conn.execute(
+            "INSERT INTO known_accounts (account, populated_at) VALUES ('populated', now())")
+        await conn.commit()  # 'stranger' is deliberately absent
+        await blockwatch.queue_refresh(conn, {
+            ("scanning", "STAR"), ("populated", "CARD"), ("stranger", "STAR")})
+        await conn.commit()
+        rows = await (await conn.execute(
+            "SELECT account FROM refresh_queue ORDER BY account")).fetchall()
+        assert [r["account"] for r in rows] == ["populated", "scanning"]
     finally:
         await conn.close()
