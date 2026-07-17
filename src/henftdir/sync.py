@@ -448,6 +448,22 @@ async def refresh_worker(
         await conn.rollback()  # release the read's snapshot (see idle note below)
         while not stop.is_set():
             try:
+                # On a fresh DB the catalog loop may not have populated
+                # `collections` when the worker starts, so `symbols` can be
+                # empty. It's normally re-read only on an idle (empty) queue
+                # -- but if there's stuck work (e.g. the seeded nftmarket ''
+                # entry) the queue never idles, so an empty list would be
+                # cached forever and every account skipped in a tight spin
+                # (found live 2026-07-17). Re-read while empty; if still
+                # empty the catalog genuinely isn't ready -> idle, don't spin.
+                if not symbols:
+                    symbols = await known_symbols(conn)
+                    await conn.rollback()
+                    if not symbols:
+                        with contextlib.suppress(asyncio.TimeoutError):
+                            await asyncio.wait_for(
+                                stop.wait(), timeout=config.REFRESH_IDLE_SECONDS)
+                        continue
                 # not_before gates retry rows: a symbol/account in backoff
                 # is invisible until its window opens, so a struggling
                 # lookup can't hot-loop the queue head while fresh work

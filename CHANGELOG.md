@@ -8,6 +8,17 @@ change); a history endpoint is deliberately not part of this design.
 
 ## [Unreleased]
 
+## [0.8.1] - 2026-07-17
+
+### Fixed
+- Refresh worker could spin (not a wedge, a hot-loop) on a fresh DB: the
+  worker caches the known-symbols list and only re-read it when the queue
+  went idle, but the startup-seeded `nftmarket` full-refresh keeps the
+  queue non-idle, so if the catalog loop hadn't populated `collections`
+  yet the empty symbol list was cached forever and every claim was skipped
+  in a tight loop. The worker now re-reads the symbol list while it's
+  empty and idles (rather than spinning) until the catalog is ready.
+
 ## [0.8.0] - 2026-07-17
 
 ### Fixed
