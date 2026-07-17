@@ -61,7 +61,11 @@ Notes:
 - Optional env vars (both roles): `LOG_LEVEL` (default `INFO`);
   `HENFT_HE_NODES` (comma-separated Hive Engine RPC endpoints — overrides
   the shipped public-node list, see §3), `HENFT_HE_MAX_CONCURRENCY` and
-  `HENFT_HE_CALL_SPACING` (politeness tuning, see §3). API-only:
+  `HENFT_HE_CALL_SPACING` (politeness tuning, see §3),
+  `HENFT_ACTIVITY_BACKFILL_BATCH` / `HENFT_ACTIVITY_BACKFILL_PAUSE`
+  (activity-backfill pacing: blocks per burst / seconds between bursts,
+  defaults 10 / 10.0 — tuned for shared public nodes; open the throttle
+  on a self-hosted node). API-only:
   `WEB_CONCURRENCY` (gunicorn workers, default 2), `WEB_TIMEOUT` (gunicorn
   worker timeout in seconds, default 90 — a never-before-seen account's
   first query does a synchronous ~150-table cold-fetch before responding;

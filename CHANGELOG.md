@@ -8,6 +8,26 @@ change); a history endpoint is deliberately not part of this design.
 
 ## [Unreleased]
 
+## [0.5.0] - 2026-07-17
+
+### Changed
+- Widened the default Hive Engine node pool from 4 to 9 (added
+  herpc.kanibot.com, api.primersion.com, herpc.tribaldex.com,
+  herpc.liotes.com, he.atexoras.com:2083 — each verified on every RPC
+  call shape the service uses and against the official node's
+  block/database hashes at a settled block) after production showed
+  sustained all-nodes-failed windows under upstream 429/503 pressure.
+- A 429 response now parks the node on the outage-grade backoff floor
+  (30s, vs the 3s floor kept for 503s) and honors a delta-seconds
+  Retry-After header (capped at 120s): retrying a rate-limited node on
+  the short floor just re-earned the same 429 and kept the client
+  flagged.
+- Slowed the activity backfill from 20 blocks/5s to 10 blocks/10s
+  (~1 block/s) — the old burst rate was drawing 429s/503s and stalling
+  the cursor on retries. Now overridable via
+  `HENFT_ACTIVITY_BACKFILL_BATCH` / `HENFT_ACTIVITY_BACKFILL_PAUSE` for
+  self-hosted nodes.
+
 ## [0.4.0] - 2026-07-11
 
 ### Changed
