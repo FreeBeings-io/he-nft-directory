@@ -8,6 +8,18 @@ change); a history endpoint is deliberately not part of this design.
 
 ## [Unreleased]
 
+## [0.6.1] - 2026-07-17
+
+### Fixed
+- Refresh worker could wedge and stop draining the queue. Its connection
+  is non-autocommit, and the idle-poll branch (empty queue) read
+  `known_symbols` without committing, leaving the connection *idle in
+  transaction* for the whole idle wait — pinning its MVCC snapshot so
+  later polls never saw rows other connections had since queued. The
+  queue only grew (observed stuck at 8). The idle branch now releases its
+  transaction before waiting. Surfaced once the 0.6.0 safety-net removal
+  created the first sustained quiet period for the worker to idle in.
+
 ## [0.6.0] - 2026-07-17
 
 ### Changed

@@ -359,6 +359,18 @@ async def refresh_worker(
                 # queued account -- the catalog rarely changes, so paying
                 # for this query once per busy-queue item is pure overhead.
                 symbols = await known_symbols(conn)
+                # Release the transaction these reads opened before idling.
+                # This connection is autocommit=False, so an uncommitted
+                # read leaves it "idle in transaction" holding its MVCC
+                # snapshot (and backend_xmin) for the whole idle wait; the
+                # next poll then reuses that stale snapshot and never sees
+                # rows other connections (block-watcher, API) have since
+                # inserted -- a wedged queue that only grows. Found live
+                # 2026-07-17: the worker pinned a snapshot from the moment
+                # the queue first emptied and stopped draining entirely.
+                # The refresh_account path commits on its own, so only this
+                # read-only idle branch needed closing.
+                await conn.rollback()
                 with contextlib.suppress(asyncio.TimeoutError):
                     await asyncio.wait_for(stop.wait(), timeout=config.REFRESH_IDLE_SECONDS)
                 continue
