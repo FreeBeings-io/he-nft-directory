@@ -8,6 +8,20 @@ change); a history endpoint is deliberately not part of this design.
 
 ## [Unreleased]
 
+## [0.8.2] - 2026-07-17
+
+### Changed
+- Block-watcher now stays `HENFT_BLOCKWATCH_SETTLE_BLOCKS` (default 1)
+  blocks behind whatever `getLatestBlockInfo` reports as head, instead of
+  chasing it immediately. The block HE just reported as head is often
+  still propagating across the node pool, so a rotation pick that differs
+  from the node that answered `getLatestBlockInfo` would null on it (found
+  live: several-per-minute "lagging node" retries at the bleeding edge,
+  after 0.8.0's never-skip fix started surfacing them as warnings). The
+  null-block retry guard still applies underneath -- this reduces how
+  often it fires, it doesn't replace it. Costs one HE block time (~3s) of
+  extra tip latency.
+
 ## [0.8.1] - 2026-07-17
 
 ### Fixed

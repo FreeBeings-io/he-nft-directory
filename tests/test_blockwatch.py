@@ -173,7 +173,7 @@ async def test_run_catches_up_sequentially_from_checkpoint():
             102: {"transactions": [tx("nftmarket", "bob")]},
             103: {"transactions": []},
         }
-        nodes = FakeNodes(head=103, blocks=blocks)
+        nodes = FakeNodes(head=104, blocks=blocks)  # +1 for the settle margin
         stop = asyncio.Event()
 
         async def stop_soon():
@@ -238,7 +238,7 @@ async def test_run_recovers_from_a_transient_failure_without_crashing(monkeypatc
             101: {"transactions": [tx("nft", "alice")]},
             102: {"transactions": []},
         }
-        nodes = FlakyFakeNodes(head=102, blocks=blocks, fail_block=101)
+        nodes = FlakyFakeNodes(head=103, blocks=blocks, fail_block=101)  # +1 for the settle margin
         stop = asyncio.Event()
 
         async def stop_once_caught_up():
@@ -274,7 +274,7 @@ async def test_run_starts_from_current_tip_when_no_checkpoint():
     schema = "bw_notip"
     conn = await fresh_conn(schema)
     try:
-        nodes = FakeNodes(head=500, blocks={500: {"transactions": []}})
+        nodes = FakeNodes(head=501, blocks={500: {"transactions": []}})  # +1 for the settle margin
         stop = asyncio.Event()
 
         async def stop_soon():
@@ -375,7 +375,7 @@ async def test_run_never_skips_a_null_block(monkeypatch):
             101: {"transactions": [tx("nft", "alice")]},
             102: {"transactions": [tx("nftmarket", "bob")]},
         }
-        nodes = LaggingFakeNodes(head=102, blocks=blocks, null_block=101)
+        nodes = LaggingFakeNodes(head=103, blocks=blocks, null_block=101)  # +1 for the settle margin
         stop = asyncio.Event()
 
         async def stop_once_caught_up():
@@ -427,5 +427,59 @@ async def test_queue_refresh_filters_to_tracked_accounts():
         rows = await (await conn.execute(
             "SELECT account FROM refresh_queue ORDER BY account")).fetchall()
         assert [r["account"] for r in rows] == ["populated", "scanning"]
+    finally:
+        await conn.close()
+
+
+async def test_run_stays_settle_margin_behind_reported_head(monkeypatch):
+    """The watcher must not fetch the block HE just reported as head -- only
+    (head - BLOCKWATCH_SETTLE_BLOCKS). Simulates the real failure this
+    guards against: get_latest_block() reports head=103 (from a fresher
+    node), but get_block(103) would still null on a lagging node in
+    rotation. With a 1-block margin, 103 is never even requested; only 101
+    and 102 (already <= the settled tip) are fetched and the checkpoint
+    stops at 102 until head advances further."""
+    monkeypatch.setattr(config, "BLOCKWATCH_IDLE_SECONDS", 0.01)
+    schema = "bw_settle"
+    conn = await fresh_conn(schema)
+    try:
+        await conn.execute(
+            "INSERT INTO sync_state (name, last_he_block) VALUES ('block_watcher', 100)"
+        )
+        await conn.commit()
+        await track(conn, "alice")
+        blocks = {
+            101: {"transactions": [tx("nft", "alice")]},
+            102: {"transactions": []},
+            # 103 deliberately UNDEFINED: if the watcher ever requested it,
+            # FakeNodes.get_block would return None and the assertion below
+            # (exact requested list) would still catch it either way.
+        }
+        nodes = FakeNodes(head=103, blocks=blocks)
+        stop = asyncio.Event()
+
+        async def stop_once_settled():
+            for _ in range(300):
+                row = await (await conn.execute(
+                    "SELECT last_he_block FROM sync_state WHERE name='block_watcher'"
+                )).fetchone()
+                if row and row["last_he_block"] == 102:
+                    break
+                await asyncio.sleep(0.01)
+            await asyncio.sleep(0.05)  # settle: prove it does NOT go further
+            stop.set()
+
+        await asyncio.gather(
+            blockwatch.run(f"{TEST_DSN} options='-c search_path={schema}'", nodes, stop),
+            stop_once_settled(),
+        )
+        # 103 (the bleeding-edge reported head) is never requested at all --
+        # the margin keeps the walk one block behind it.
+        assert 103 not in nodes.requested
+        assert nodes.requested == [101, 102]
+        row = await (await conn.execute(
+            "SELECT last_he_block FROM sync_state WHERE name='block_watcher'"
+        )).fetchone()
+        assert row["last_he_block"] == 102
     finally:
         await conn.close()

@@ -69,7 +69,11 @@ Notes:
   cached account read triggers a background re-fetch, default 21600),
   `HENFT_REFRESH_WORKER_BATCH` (queued accounts the sync worker refreshes
   concurrently, each on its own DB connection; default =
-  `HENFT_HE_MAX_CONCURRENCY`, bounded overall by the HE node semaphore).
+  `HENFT_HE_MAX_CONCURRENCY`, bounded overall by the HE node semaphore),
+  `HENFT_BLOCKWATCH_SETTLE_BLOCKS` (blocks the watcher stays behind the
+  reported HE head before fetching, default 1 — raise on a node pool with
+  more propagation lag, lower to 0 only against a single self-hosted node
+  where there's no rotation to lag).
   API-only:
   `WEB_CONCURRENCY` (gunicorn workers, default 2), `WEB_TIMEOUT` (gunicorn
   worker timeout in seconds, default 90 — a never-before-seen account's
