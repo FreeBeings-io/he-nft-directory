@@ -39,6 +39,20 @@ class HeNodeError(Exception):
     """Transport-level failure across all nodes."""
 
 
+def _parse_retry_after(response: httpx.Response) -> float | None:
+    """Seconds from a Retry-After header, or None. Only the delta-seconds
+    form is handled; the HTTP-date form (rare on these nodes) is ignored
+    rather than parsed against a possibly-skewed local clock."""
+    value = response.headers.get("Retry-After")
+    if value is None:
+        return None
+    try:
+        seconds = float(value)
+    except ValueError:
+        return None
+    return seconds if seconds >= 0 else None
+
+
 class HENodes:
     def __init__(self, nodes: list[str] | None = None):
         self.nodes = list(nodes or config.HE_NODES)
@@ -150,9 +164,23 @@ class HENodes:
                         # A short backoff lets rotation route around it
                         # without a big cold-fetch cascading every node into
                         # the same cooldown reserved for real outages.
-                        self._record_failure(
-                            node, floor=config.HE_STATUS_FAILURE_BACKOFF_FLOOR_SECONDS,
-                        )
+                        # A 429 is the opposite case: the node is telling
+                        # this client it's over budget, so the 3s floor
+                        # just re-earns the same 429 -- park the node on
+                        # the outage-grade floor instead, or at least as
+                        # long as its Retry-After asks (capped; AIMD
+                        # doubling in _record_failure still applies).
+                        if exc.response.status_code == 429:
+                            floor = config.HE_RATE_LIMIT_BACKOFF_FLOOR_SECONDS
+                            retry_after = _parse_retry_after(exc.response)
+                            if retry_after is not None:
+                                floor = min(
+                                    max(floor, retry_after),
+                                    config.HE_RETRY_AFTER_CAP_SECONDS,
+                                )
+                        else:
+                            floor = config.HE_STATUS_FAILURE_BACKOFF_FLOOR_SECONDS
+                        self._record_failure(node, floor=floor)
                         last_cause = f"{node}: {exc!r}"
                         logger.debug("HE failover: %s", last_cause)
                         continue

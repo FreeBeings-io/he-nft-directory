@@ -34,7 +34,21 @@ HE_NODES = [
     "https://api2.hive-engine.com/rpc",
     "https://herpc.dtools.dev",
     "https://enginerpc.com",
+    # Added 2026-07-17 after production logs showed sustained "all HE nodes
+    # failed" windows (429s/503s) with only four nodes. Each passed the same
+    # admission bar as the originals: both endpoints unrestricted (blockchain
+    # getLatestBlockInfo + contracts find) AND identical block/database
+    # hashes vs api.hive-engine.com at settled block 61160000.
+    "https://herpc.kanibot.com",
+    "https://api.primersion.com",
+    "https://herpc.tribaldex.com",
+    "https://herpc.liotes.com",
+    "https://he.atexoras.com:2083",
 ]
+# 2026-07-17 admission sweep also REJECTED: engine.deathwing.me (525 at the
+# edge), engine.beeswap.tools / herpc.hivelive.me / he.ausbit.dev /
+# engine.rishipanthee.com (no response), he.sourov.dev (Cloudflare
+# challenge page, not JSON), herpc.actifit.io (still barred -- see above).
 # Deployment override: HENFT_HE_NODES as a comma-separated list, e.g.
 #   HENFT_HE_NODES=http://my-he-node:5000   (self-hosted; see DEPLOY.md §3)
 if os.environ.get("HENFT_HE_NODES"):
@@ -87,6 +101,13 @@ HE_FAILURE_BACKOFF_FLOOR_SECONDS = 30
 # once isolated from the burst -- confirming it's momentary, not a real
 # outage. See henodes.py's call().
 HE_STATUS_FAILURE_BACKOFF_FLOOR_SECONDS = 3
+# 429 is not a 503: the node is explicitly saying "you, specifically, are
+# too fast," so re-trying it on the 503 floor (3s) just re-earns the same
+# 429 and keeps the client flagged. Give it the full outage-grade floor,
+# and honor an explicit Retry-After header (capped -- a misconfigured node
+# must not park itself for an hour) when the node provides one.
+HE_RATE_LIMIT_BACKOFF_FLOOR_SECONDS = 30
+HE_RETRY_AFTER_CAP_SECONDS = 120
 HE_FAILURE_BACKOFF_CAP_SECONDS = 600
 HE_FAILURE_BACKOFF_DECAY = 0.95
 # Found live: under *sustained* contention (not a one-off blip), a symbol
@@ -142,13 +163,18 @@ SAFETY_NET_BATCH_SIZE = 200
 # loop, pruned past the window. The window is a product promise ("recent
 # activity"), not an archive -- see the nft_events schema comment.
 ACTIVITY_WINDOW_DAYS = 30
-# Backfill politeness: BATCH blocks per burst, then PAUSE. 20 blocks / 5s
-# (~4 blocks/s) walks a 30-day window (~850k blocks) in roughly 2.5 days --
-# deliberately slow; the feed serves partial coverage honestly meanwhile
-# (see /status activity.backfill). Uses its own small HENodes pool so it
-# can never starve the block-watcher or the market sweep.
-ACTIVITY_BACKFILL_BATCH = 20
-ACTIVITY_BACKFILL_PAUSE_SECONDS = 5.0
+# Backfill politeness: BATCH blocks per burst, then PAUSE. Was 20/5s
+# (~4 blocks/s); production logs 2026-07-17 showed those bursts drawing
+# 429s from herpc.dtools.dev and 503s from api2.hive-engine.com, stalling
+# the cursor on "all HE nodes failed" for whole passes. 10 blocks / 10s
+# (~1 block/s) walks a 30-day window (~850k blocks) in roughly 10 days --
+# slower still, but a cursor that advances beats one that retries; the
+# feed serves partial coverage honestly meanwhile (see /status
+# activity.backfill). Uses its own small HENodes pool so it can never
+# starve the block-watcher or the market sweep. Env-overridable so an
+# operator on a self-hosted node can open the throttle.
+ACTIVITY_BACKFILL_BATCH = _env_int("HENFT_ACTIVITY_BACKFILL_BATCH", 10)
+ACTIVITY_BACKFILL_PAUSE_SECONDS = _env_float("HENFT_ACTIVITY_BACKFILL_PAUSE", 10.0)
 # Prune once a day (founder call): with a 30-day window a daily prune
 # overshoots retention by at most ~3%, and one small indexed DELETE per day
 # beats constant delete churn.
