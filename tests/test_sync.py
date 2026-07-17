@@ -901,3 +901,49 @@ async def test_worker_stays_targeted_for_already_known_account():
         assert sorted({t[1] for t in nodes.calls}) == ["CARDinstances"]  # targeted only
     finally:
         await conn.close()
+
+
+async def test_worker_does_not_spin_on_empty_catalog(monkeypatch):
+    """On a fresh DB the catalog may be empty when the worker starts. With
+    stuck work in the queue (the queue never idles), an empty symbol list
+    must NOT be cached-and-spun-on forever -- the worker idles until the
+    catalog appears, then processes. Regression for the 2026-07-17 nftmarket
+    hot-loop (97k warnings/min, worker pegged)."""
+    monkeypatch.setattr(config, "REFRESH_IDLE_SECONDS", 0.02)
+    conn = await fresh_conn("sync_emptycat")
+    try:
+        # queued work but NO collections yet (catalog not populated)
+        await conn.execute(
+            "INSERT INTO refresh_queue (account, symbol) VALUES ('nftmarket', '')")
+        await conn.commit()
+        nodes = FakeNodes({("nft", "CARDinstances"): [[]]})
+        stop = asyncio.Event()
+
+        async def add_catalog_then_stop():
+            await asyncio.sleep(0.1)   # worker should be idling, not spinning
+            # queue must NOT have been churned into oblivion; still there
+            row = await (await conn.execute(
+                "SELECT 1 FROM refresh_queue WHERE account='nftmarket'")).fetchone()
+            assert row is not None
+            # now the catalog appears -> worker should process + populate
+            await conn.execute("INSERT INTO collections (symbol) VALUES ('CARD')")
+            await conn.commit()
+            for _ in range(200):
+                done = await (await conn.execute(
+                    "SELECT populated_at IS NOT NULL AS p FROM known_accounts "
+                    "WHERE account='nftmarket'")).fetchone()
+                if done and done["p"]:
+                    break
+                await asyncio.sleep(0.02)
+            stop.set()
+
+        await asyncio.gather(
+            _run_worker("sync_emptycat", nodes, stop, batch=2),
+            add_catalog_then_stop())
+        # nftmarket got fully populated once the catalog was available
+        row = await (await conn.execute(
+            "SELECT populated_at IS NOT NULL AS p FROM known_accounts "
+            "WHERE account='nftmarket'")).fetchone()
+        assert row is not None and row["p"] is True
+    finally:
+        await conn.close()
