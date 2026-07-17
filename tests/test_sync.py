@@ -26,6 +26,23 @@ async def fresh_conn(schema: str):
     return conn
 
 
+def _connect(schema: str):
+    """A connection factory bound to a test schema -- what refresh_worker
+    uses to open its per-slot worker connections."""
+    return lambda: db.connect(f"{TEST_DSN} options='-c search_path={schema}'")
+
+
+async def _run_worker(schema, nodes, stop, batch=None):
+    """Run refresh_worker with its own control connection (never the test's
+    assertion/poller connection) + the per-slot factory. Closes the control
+    conn when the worker returns."""
+    ctrl = await db.connect(f"{TEST_DSN} options='-c search_path={schema}'")
+    try:
+        await sync.refresh_worker(ctrl, _connect(schema), nodes, stop, batch=batch)
+    finally:
+        await ctrl.close()
+
+
 class FakeNodes:
     """find() keyed by (contract, table) -> list of pages (each call pops
     the next page; a missing key means "no more results"). A table listed
@@ -237,7 +254,7 @@ async def test_refresh_worker_continues_after_a_failure(monkeypatch):
             stop.set()
 
         await asyncio.gather(
-            sync.refresh_worker(conn, nodes, stop), stop_once_drained(),
+            _run_worker("sync_workerfail", nodes, stop, batch=2), stop_once_drained(),
         )
         assert set(calls) == {"alice", "bob"}  # bob still processed after alice's failure
         row = await (await conn.execute(
@@ -376,7 +393,7 @@ async def test_refresh_worker_skips_rows_still_in_backoff():
             await asyncio.sleep(0.3)
             stop.set()
 
-        await asyncio.gather(sync.refresh_worker(conn, nodes, stop), stop_soon())
+        await asyncio.gather(_run_worker("sync_backoffgate", nodes, stop), stop_soon())
         assert nodes.calls == []  # never touched: row is in backoff
         row = await (await conn.execute(
             "SELECT 1 FROM refresh_queue WHERE account = 'alice'"
@@ -406,14 +423,10 @@ async def test_refresh_worker_drains_queue_then_idles():
                 await asyncio.sleep(0.01)
             stop.set()
 
-        worker_conn = await db.connect(f"{TEST_DSN} options='-c search_path=sync_worker'")
-        try:
-            await asyncio.gather(
-                sync.refresh_worker(worker_conn, nodes, stop),
-                stop_once_drained(),
-            )
-        finally:
-            await worker_conn.close()
+        await asyncio.gather(
+            _run_worker("sync_worker", nodes, stop),
+            stop_once_drained(),
+        )
         rows = await (await conn.execute("SELECT * FROM instances")).fetchall()
         assert len(rows) == 1 and rows[0]["nft_id"] == 9
     finally:
@@ -452,14 +465,10 @@ async def test_refresh_worker_caches_known_symbols_across_queued_accounts(monkey
                 await asyncio.sleep(0.01)
             stop.set()
 
-        worker_conn = await db.connect(f"{TEST_DSN} options='-c search_path=sync_workercache'")
-        try:
-            await asyncio.gather(
-                sync.refresh_worker(worker_conn, nodes, stop),
-                stop_once_drained(),
-            )
-        finally:
-            await worker_conn.close()
+        await asyncio.gather(
+            _run_worker("sync_workercache", nodes, stop),
+            stop_once_drained(),
+        )
         # 1 initial fetch, at most 1 more on first empty-queue detection --
         # never one per queued account (which would be 3+ here).
         assert calls["n"] <= 2
@@ -652,37 +661,97 @@ async def test_refresh_worker_does_not_linger_idle_in_transaction():
         nodes = FakeNodes({("nft", "CARDinstances"): [[]]})
         stop = asyncio.Event()
         seen_idle = asyncio.Event()
+        # `conn` is the worker's CONTROL connection here (so we can inspect
+        # its transaction state); the observer touches the DB only through a
+        # SEPARATE connection, never `conn`, while the worker is running.
+        obs = await db.connect(f"{TEST_DSN} options='-c search_path=sync_idletxn'")
 
         async def observe_then_feed():
             # let the worker poll the empty queue and enter its idle wait
-            await asyncio.sleep(0.2)
-            # the fix: connection is not left mid-transaction while idling
+            await asyncio.sleep(0.3)
+            # the fix: control conn is not left mid-transaction while idling
             assert conn.info.transaction_status == TransactionStatus.IDLE
             seen_idle.set()
-            # a DIFFERENT connection inserts work after the worker idled once
-            conn2 = await db.connect(
-                f"{TEST_DSN} options='-c search_path=sync_idletxn'")
-            try:
-                await conn2.execute(
-                    "INSERT INTO refresh_queue (account, symbol) VALUES ('late', 'CARD')")
-                await conn2.commit()
-            finally:
-                await conn2.close()
-            # worker must pick it up (stale snapshot would never see it)
+            # work inserted by a DIFFERENT connection AFTER the worker idled
+            await obs.execute(
+                "INSERT INTO refresh_queue (account, symbol) VALUES ('late', 'CARD')")
+            await obs.commit()
+            # worker must pick it up (a stale pinned snapshot never would)
             for _ in range(100):
-                left = await (await conn.execute(
+                left = await (await obs.execute(
                     "SELECT count(*) AS n FROM refresh_queue")).fetchone()
-                await conn.rollback()
+                await obs.rollback()
                 if left["n"] == 0:
                     break
                 await asyncio.sleep(0.05)
             stop.set()
 
+        try:
+            await asyncio.gather(
+                sync.refresh_worker(conn, _connect("sync_idletxn"), nodes, stop),
+                observe_then_feed())
+            assert seen_idle.is_set()
+            left = await (await obs.execute(
+                "SELECT count(*) AS n FROM refresh_queue")).fetchone()
+            assert left["n"] == 0  # the late-inserted row was drained
+        finally:
+            await obs.close()
+    finally:
+        await conn.close()
+
+
+async def test_refresh_worker_drains_accounts_concurrently():
+    """Account-level parallelism: a batch of queued accounts must refresh
+    concurrently (each on its own connection), not serially. We gate each
+    account's HE lookup on a shared barrier that only releases once all
+    `batch` accounts are in-flight at once -- if the worker were serial it
+    would deadlock on the barrier and the test would time out."""
+    conn = await fresh_conn("sync_parallel")
+    try:
+        await conn.execute("INSERT INTO collections (symbol) VALUES ('CARD')")
+        accounts = [f"acct{i}" for i in range(4)]
+        for a in accounts:
+            await conn.execute(
+                "INSERT INTO refresh_queue (account, symbol) VALUES (%s, 'CARD')", (a,))
+        await conn.commit()
+
+        in_flight = 0
+        all_in_flight = asyncio.Event()
+
+        class BarrierNodes:
+            def __init__(self): self.calls = []
+            async def find(self, contract, table, query, limit=1000, offset=0, indexes=None):
+                nonlocal in_flight
+                self.calls.append(account := query.get("account"))
+                in_flight += 1
+                if in_flight >= len(accounts):
+                    all_in_flight.set()
+                # block until every account's lookup is concurrently in-flight
+                await asyncio.wait_for(all_in_flight.wait(), timeout=5)
+                return []
+            async def find_one(self, contract, table, query):
+                return None
+
+        nodes = BarrierNodes()
+        stop = asyncio.Event()
+
+        async def stop_once_drained():
+            for _ in range(200):
+                row = await (await conn.execute("SELECT 1 FROM refresh_queue")).fetchone()
+                if row is None:
+                    break
+                await asyncio.sleep(0.02)
+            stop.set()
+
+        # batch >= number of accounts so they can all be claimed together
         await asyncio.gather(
-            sync.refresh_worker(conn, nodes, stop), observe_then_feed())
-        assert seen_idle.is_set()
-        left = await (await conn.execute(
-            "SELECT count(*) AS n FROM refresh_queue")).fetchone()
-        assert left["n"] == 0  # the late-inserted row was drained
+            _run_worker("sync_parallel", nodes, stop, batch=4),
+            stop_once_drained(),
+        )
+        # barrier only releases if all 4 were concurrently in-flight
+        assert all_in_flight.is_set()
+        assert sorted(nodes.calls) == accounts
+        left = await (await conn.execute("SELECT count(*) AS n FROM refresh_queue")).fetchone()
+        assert left["n"] == 0
     finally:
         await conn.close()
