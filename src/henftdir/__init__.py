@@ -2,4 +2,4 @@
 state -- balances, collection metadata, market. No transaction history
 by design."""
 
-__version__ = "0.8.1"
+__version__ = "0.8.2"

@@ -1,6 +1,6 @@
 [project]
 name = "he-nft-directory"
-version = "0.8.1"
+version = "0.8.2"
 description = "Hive Engine NFT Directory: a read-through cache over HE's own current state, for wallets and dApps"
 readme = "README.md"
 license = "MIT"

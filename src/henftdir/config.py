@@ -127,6 +127,18 @@ HE_RETRY_BACKOFF = 2.0
 # block_watcher: idle wait between polls once caught up to HE's head (HE
 # blocks land roughly every 3s, matching Hive's own block time).
 BLOCKWATCH_IDLE_SECONDS = 3.0
+# The watcher never fetches closer than this many blocks behind whatever
+# getLatestBlockInfo reports as head -- i.e. it treats (head - MARGIN) as
+# the real, fetchable tip. Without this, the block just-reported as head is
+# often still propagating across the node pool: a DIFFERENT node than the
+# one that answered getLatestBlockInfo gets asked for it via rotation and
+# returns null because it hasn't caught up yet (found live 2026-07-17:
+# several-per-minute "lagging node" retries at the bleeding edge). Those
+# retries are harmless (the null-block guard never skips), just wasted
+# calls and log noise. A 1-block margin costs ~3s of extra tip latency
+# (one HE block time) and gives the pool that long to settle before this
+# service ever asks for it.
+BLOCKWATCH_SETTLE_BLOCKS = _env_int("HENFT_BLOCKWATCH_SETTLE_BLOCKS", 1)
 
 # refresh_worker: idle wait when refresh_queue is empty.
 REFRESH_IDLE_SECONDS = 5.0

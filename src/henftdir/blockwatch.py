@@ -215,7 +215,12 @@ async def run(app_dsn: str, nodes: HENodes, stop: asyncio.Event) -> None:
     null result (a lagging node) or a processing error leaves last_he_block
     where it is and retries, so the walk can never skip a block. Skipping is
     the root failure -- every downstream cache gap traces back to an event
-    in an unprocessed block."""
+    in an unprocessed block.
+
+    The walk also never targets closer than config.BLOCKWATCH_SETTLE_BLOCKS
+    behind the reported head (see that constant) -- reduces, but does not
+    replace, the need for the null-block retry above: rotation can still
+    pick a node that's unusually far behind."""
     conn = await db.connect(app_dsn)
     try:
         row = await (await conn.execute(
@@ -225,9 +230,11 @@ async def run(app_dsn: str, nodes: HENodes, stop: asyncio.Event) -> None:
         while not stop.is_set():
             try:
                 latest = await nodes.get_latest_block()
-                head = latest["blockNumber"]
+                # Treat (reported head - settle margin) as the real,
+                # fetchable tip -- see BLOCKWATCH_SETTLE_BLOCKS.
+                head = latest["blockNumber"] - config.BLOCKWATCH_SETTLE_BLOCKS
                 if last is None:
-                    last = head - 1  # start from the current tip, not genesis
+                    last = head - 1  # start from the settled tip, not genesis
                 if last >= head:
                     with contextlib.suppress(asyncio.TimeoutError):
                         await asyncio.wait_for(stop.wait(), timeout=config.BLOCKWATCH_IDLE_SECONDS)
@@ -237,9 +244,11 @@ async def run(app_dsn: str, nodes: HENodes, stop: asyncio.Event) -> None:
                 if block is None:
                     # next_block <= head (guarded above), so this block DOES
                     # exist -- a node returned null because it's lagging
-                    # behind the head another node reported, NOT because the
-                    # block is absent. Advancing past it would SILENTLY skip
-                    # the block and every NFT event in it, forever: the one
+                    # behind the head another node reported (rarer now with
+                    # the settle margin, but rotation can still pick an
+                    # unusually-behind node), NOT because the block is
+                    # absent. Advancing past it would SILENTLY skip the
+                    # block and every NFT event in it, forever: the one
                     # failure this design cannot recover from, and the root
                     # of any downstream cache gap. So do NOT advance -- retry
                     # next cycle (node rotation tries a different node). A
@@ -248,8 +257,8 @@ async def run(app_dsn: str, nodes: HENodes, stop: asyncio.Event) -> None:
                     # silent skip. The brief idle avoids hot-looping a
                     # lagging node during catch-up.
                     logger.warning(
-                        "block_watcher: null for block %d (<= head %d) -- not "
-                        "advancing, retrying (lagging node?)", next_block, head)
+                        "block_watcher: null for block %d (<= settled head %d) "
+                        "-- not advancing, retrying (lagging node?)", next_block, head)
                     with contextlib.suppress(asyncio.TimeoutError):
                         await asyncio.wait_for(
                             stop.wait(), timeout=config.BLOCKWATCH_IDLE_SECONDS)
