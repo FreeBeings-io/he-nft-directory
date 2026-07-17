@@ -633,3 +633,56 @@ async def test_targeted_refresh_does_not_reset_staleness_clock():
         assert row["fresh"] is True  # full pass resets it
     finally:
         await conn.close()
+
+
+async def test_refresh_worker_does_not_linger_idle_in_transaction():
+    """Regression (live 2026-07-17): the worker connect is autocommit=False,
+    so the read-only idle branch (empty queue -> known_symbols -> wait) left
+    a transaction open for the whole idle period, pinning its MVCC snapshot.
+    The next poll reused that stale snapshot and never saw rows inserted by
+    other connections (block-watcher/API) -- the queue wedged and only grew.
+    After idling on an empty queue the worker must hold NO open transaction,
+    and must then see a row a SECOND connection inserts afterward."""
+    from psycopg.pq import TransactionStatus
+
+    conn = await fresh_conn("sync_idletxn")
+    try:
+        await conn.execute("INSERT INTO collections (symbol) VALUES ('CARD')")
+        await conn.commit()
+        nodes = FakeNodes({("nft", "CARDinstances"): [[]]})
+        stop = asyncio.Event()
+        seen_idle = asyncio.Event()
+
+        async def observe_then_feed():
+            # let the worker poll the empty queue and enter its idle wait
+            await asyncio.sleep(0.2)
+            # the fix: connection is not left mid-transaction while idling
+            assert conn.info.transaction_status == TransactionStatus.IDLE
+            seen_idle.set()
+            # a DIFFERENT connection inserts work after the worker idled once
+            conn2 = await db.connect(
+                f"{TEST_DSN} options='-c search_path=sync_idletxn'")
+            try:
+                await conn2.execute(
+                    "INSERT INTO refresh_queue (account, symbol) VALUES ('late', 'CARD')")
+                await conn2.commit()
+            finally:
+                await conn2.close()
+            # worker must pick it up (stale snapshot would never see it)
+            for _ in range(100):
+                left = await (await conn.execute(
+                    "SELECT count(*) AS n FROM refresh_queue")).fetchone()
+                await conn.rollback()
+                if left["n"] == 0:
+                    break
+                await asyncio.sleep(0.05)
+            stop.set()
+
+        await asyncio.gather(
+            sync.refresh_worker(conn, nodes, stop), observe_then_feed())
+        assert seen_idle.is_set()
+        left = await (await conn.execute(
+            "SELECT count(*) AS n FROM refresh_queue")).fetchone()
+        assert left["n"] == 0  # the late-inserted row was drained
+    finally:
+        await conn.close()
