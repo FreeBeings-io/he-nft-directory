@@ -8,6 +8,8 @@ change); a history endpoint is deliberately not part of this design.
 
 ## [Unreleased]
 
+## [0.6.0] - 2026-07-17
+
 ### Changed
 - Freshness now scales with usage instead of fleet size — the hourly
   safety-net sweep is removed, replaced by three guarantees:
