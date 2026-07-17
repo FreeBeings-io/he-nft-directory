@@ -7,9 +7,10 @@ Three independent loops, none of them a ledger:
 - refresh_worker (sync.py): drains that queue, re-fetching each account's
   full current holdings straight from HE.
 - periodic sweeps: the collection catalog and market books (cheap, full
-  mirrors), and a slow safety-net re-touch of every known account (catches
-  anything the block-watcher ever missed -- insurance, not the primary
-  freshness path).
+  mirrors). There is deliberately NO full-fleet account sweep: failed
+  lookups retry durably from the queue with backoff, and a stale account
+  is re-fetched when someone reads it (api._ensure_known) -- correction
+  scales with usage and failures, not fleet size.
 
 HE node pools are split three ways, each an isolated HENodes instance with
 its own concurrency budget, rate limiter, and backoff state:
@@ -23,12 +24,14 @@ its own concurrency budget, rate limiter, and backoff state:
 - market loop: its own pool. Found live: sharing with the account-refresh
   loops meant the market sweep was starved for minutes during the heavy
   account-refresh bursts (each account is ~150 per-symbol lookups; a
-  safety-net batch or a queue drain saturates the pool), so market coverage
+  queue drain saturates the pool), so market coverage
   crawled in. Its own budget keeps floors/last-sale fresh independent of
   refresh load.
-- refresh_worker + catalog + safety-net: share one pool. These are the
-  "bulk, some delay is fine" account-refresh loops; the catalog sweep is
-  light and periodic, so it rides along without issue.
+- refresh_worker + catalog: share one pool. These are the "bulk, some
+  delay is fine" loops; the catalog sweep is light and periodic, so it
+  rides along without issue. (The hourly safety-net sweep that used to
+  share this pool was removed 2026-07-17 -- durable queue retries +
+  read-staleness refreshes replaced it; see sync.py.)
 - activity backfill: its own pool. It's the lowest-priority loop in the
   service (an advisory feed filling backward through old blocks), so it
   must never compete with anything above -- and nothing above should ever
@@ -67,12 +70,10 @@ class Service:
         *,
         catalog_interval: float = config.CATALOG_INTERVAL_SECONDS,
         market_interval: float = config.MARKET_INTERVAL_SECONDS,
-        safety_net_interval: float = config.SAFETY_NET_INTERVAL_SECONDS,
     ):
         self.app_dsn = app_dsn
         self.catalog_interval = catalog_interval
         self.market_interval = market_interval
-        self.safety_net_interval = safety_net_interval
         self.stop = asyncio.Event()
 
     def install_signal_handlers(self) -> None:
@@ -101,7 +102,6 @@ class Service:
                 asyncio.create_task(self._refresh_worker(bulk_nodes)),
                 asyncio.create_task(self._catalog_loop(bulk_nodes)),
                 asyncio.create_task(self._market_loop(market_nodes)),
-                asyncio.create_task(self._safety_net_loop(bulk_nodes)),
                 asyncio.create_task(self._activity_backfill_loop(activity_nodes)),
                 asyncio.create_task(self._activity_prune_loop()),
             ]
@@ -242,18 +242,3 @@ class Service:
         finally:
             await conn.close()
 
-    async def _safety_net_loop(self, nodes: HENodes) -> None:
-        conn = await db.connect(self.app_dsn)
-        try:
-            while not self.stop.is_set():
-                try:
-                    n = await sync.safety_net_sweep(conn, nodes)
-                    if n:
-                        logger.info("safety-net sweep: re-touched %d account(s)", n)
-                except Exception as exc:
-                    logger.error("safety-net sweep failed: %r", exc)
-                    await conn.rollback()
-                with contextlib.suppress(asyncio.TimeoutError):
-                    await asyncio.wait_for(self.stop.wait(), timeout=self.safety_net_interval)
-        finally:
-            await conn.close()

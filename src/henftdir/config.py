@@ -131,7 +131,7 @@ BLOCKWATCH_IDLE_SECONDS = 3.0
 # refresh_worker: idle wait when refresh_queue is empty.
 REFRESH_IDLE_SECONDS = 5.0
 # Pause between concurrency-sized chunks of symbol lookups for BACKGROUND
-# account refreshes (queue drain + safety-net) -- found live 2026-07-10: an
+# account refreshes (queue drain) -- found live 2026-07-10: an
 # un-paced ~115-symbol refresh saturates the pool for several seconds,
 # 503-cooldowns every node at once, and produces a "no nodes" retry storm
 # for anything else in flight (~4k retry warnings in hours from one heavy
@@ -139,8 +139,21 @@ REFRESH_IDLE_SECONDS = 5.0
 # stays un-paced (a user is waiting).
 REFRESH_PACE_SECONDS = 0.5
 
+# Retry backoff for failed symbol lookups re-enqueued into refresh_queue
+# (sync._requeue_failed): base * 2^attempts, capped. The cap matters more
+# than the base -- during a sustained multi-node outage every pending
+# retry converges to one attempt per cap window, which must stay polite.
+REFRESH_RETRY_BASE_SECONDS = 60
+REFRESH_RETRY_CAP_SECONDS = 21600  # 6h
+
+# A cached account older than this gets a background refresh enqueued when
+# it's read (api._ensure_known) -- the freshness bound is tied to access,
+# so correction work scales with real usage, not fleet size. This replaced
+# the hourly full-fleet safety-net sweep (see sync.py).
+ACCOUNT_STALE_AFTER_SECONDS = _env_float("HENFT_ACCOUNT_STALE_AFTER", 21600.0)
+
 # Full collection-catalog mirror (~150 rows platform-wide) -- cheap, so
-# refreshed often relative to the safety-net sweep below.
+# refreshed often.
 CATALOG_INTERVAL_SECONDS = 300
 
 # Per-symbol sell-book mirror, for every symbol that has cached instances
@@ -151,12 +164,6 @@ MARKET_INTERVAL_SECONDS = 300
 # can't be fully paginated on public HE at all; refresh_market degrades to a
 # best-effort floor from what it fetched rather than failing the symbol.
 MARKET_MAX_PAGES = 10
-
-# Safety-net sweep: NOT the primary freshness mechanism (the block-watcher
-# + refresh_queue is) -- just periodic insurance against a missed/
-# misparsed block. Batched and slow on purpose.
-SAFETY_NET_INTERVAL_SECONDS = 3600
-SAFETY_NET_BATCH_SIZE = 200
 
 # Rolling activity feed (nft_events): captured live by the block-watcher,
 # backfilled backward toward the window start by a low-priority background

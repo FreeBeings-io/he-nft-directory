@@ -5,6 +5,9 @@ already reported inline (emitted events / payload).
 """
 
 import json
+import logging
+
+logger = logging.getLogger(__name__)
 
 
 def is_nft_tx(contract: str) -> bool:
@@ -78,7 +81,8 @@ def touched_accounts(tx: dict) -> set[str]:
     # so fall back to whatever the payload itself names directly -- best
     # effort only; a payload like setProperties has no owner field at all,
     # so an affected holder's cache can go briefly stale until their own
-    # next refresh (acceptable: the periodic safety-net sweep catches it).
+    # next refresh (acceptable: a queued touch, a later read past the
+    # staleness bound, or the holder's own next activity corrects it).
     scan(_load_json(tx.get("payload"), {}))
 
     return accounts
@@ -101,6 +105,43 @@ _EVENT_OPS = {
     "cancelOrder": "market_cancel",
     "changePrice": "market_price_change",
 }
+
+
+# nft/nftmarket event names that are KNOWN and deliberately not activity
+# (contract-admin / lifecycle events; from contracts/nft.js and
+# contracts/nftmarket.js `api.emit` call sites). Anything emitted by the
+# nft contracts that is in neither this set nor _EVENT_OPS is an event
+# shape this parser has never seen -- almost certainly a contract update.
+# Refresh triggering is still safe (touched_accounts scans every event's
+# data for account fields regardless of name), but the activity feed
+# won't carry it and the parser should be reviewed -- so warn, loudly and
+# once per name per process. This alarm is what lets the service run
+# WITHOUT a periodic full-fleet reconciliation sweep: the one failure
+# class a durable retry queue can't catch is "we didn't know to look",
+# and this turns that from silent drift into a visible signal.
+_NON_ACTIVITY_EVENTS = frozenset({
+    "create", "updateUrl", "updateMetadata", "updateName", "updateOrgName",
+    "updateProductName", "addProperty", "setProperties", "setGroupBy",
+    "setPropertyPermissions", "updatePropertyDefinition", "enableDelegation",
+    "setUndelegationCooldown", "addAuthorizedIssuingAccounts",
+    "addAuthorizedIssuingContracts", "removeAuthorizedIssuingAccounts",
+    "removeAuthorizedIssuingContracts", "transferOwnership", "enableMarket",
+    "setMarketParams", "hitSellOrder",
+})
+_warned_unknown_events: set[str] = set()
+
+
+def _check_unknown_event(name: str) -> None:
+    if (name and name not in _EVENT_OPS
+            and name not in _NON_ACTIVITY_EVENTS
+            and name not in _warned_unknown_events):
+        _warned_unknown_events.add(name)
+        logger.warning(
+            "unrecognized nft-contract event %r -- refreshes still trigger "
+            "(account-field scan is name-agnostic), but the activity feed "
+            "skips it; review catalog._EVENT_OPS/_NON_ACTIVITY_EVENTS "
+            "against the current HE contract source", name,
+        )
 
 
 def nft_events(tx: dict, he_block: int, ts) -> list[dict]:
@@ -126,6 +167,7 @@ def nft_events(tx: dict, he_block: int, ts) -> list[dict]:
         if not is_nft_tx(event.get("contract")):
             continue
         name = event.get("event")
+        _check_unknown_event(name)
         data = event.get("data") or {}
         if name == "hitSellOrder":
             symbol = data.get("symbol")

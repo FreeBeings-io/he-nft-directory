@@ -214,20 +214,24 @@ async def test_refresh_worker_continues_after_a_failure(monkeypatch):
         calls = []
         real_refresh_account = sync.refresh_account
 
-        async def flaky_refresh(conn, nodes, account, symbols):
+        async def flaky_refresh(conn, nodes, account, symbols, **kw):
             calls.append(account)
             if account == "alice":
                 raise RuntimeError("simulated failure")
-            return await real_refresh_account(conn, nodes, account, symbols)
+            return await real_refresh_account(conn, nodes, account, symbols, **kw)
 
         monkeypatch.setattr(sync, "refresh_account", flaky_refresh)
         nodes = FakeNodes({("nft", "CARDinstances"): [[]]})
         stop = asyncio.Event()
 
         async def stop_once_drained():
+            # done when bob's row is gone and alice's has been pushed into
+            # backoff (rescheduled, NOT deleted -- deleting lost the work)
             for _ in range(100):
-                row = await (await conn.execute("SELECT 1 FROM refresh_queue")).fetchone()
-                if row is None:
+                pending = await (await conn.execute(
+                    "SELECT count(*) AS n FROM refresh_queue "
+                    "WHERE not_before <= now()")).fetchone()
+                if pending["n"] == 0:
                     break
                 await asyncio.sleep(0.01)
             stop.set()
@@ -236,37 +240,16 @@ async def test_refresh_worker_continues_after_a_failure(monkeypatch):
             sync.refresh_worker(conn, nodes, stop), stop_once_drained(),
         )
         assert set(calls) == {"alice", "bob"}  # bob still processed after alice's failure
-        queued = await (await conn.execute("SELECT 1 FROM refresh_queue")).fetchone()
-        assert queued is None  # both dequeued, including the failed one
+        row = await (await conn.execute(
+            "SELECT account, attempts, not_before > now() AS deferred "
+            "FROM refresh_queue")).fetchone()
+        # alice's failed row survives as a backoff-deferred retry
+        assert row["account"] == "alice"
+        assert row["attempts"] == 1 and row["deferred"] is True
     finally:
         await conn.close()
 
 
-async def test_safety_net_sweep_continues_after_a_failure(monkeypatch):
-    conn = await fresh_conn("sync_safetynetfail")
-    try:
-        await conn.execute("INSERT INTO collections (symbol) VALUES ('CARD')")
-        await conn.execute(
-            "INSERT INTO known_accounts (account) VALUES ('alice'), ('bob')"
-        )
-        await conn.commit()
-
-        calls = []
-        real_refresh_account = sync.refresh_account
-
-        async def flaky_refresh(conn, nodes, account, symbols):
-            calls.append(account)
-            if account == "alice":
-                raise RuntimeError("simulated failure")
-            return await real_refresh_account(conn, nodes, account, symbols)
-
-        monkeypatch.setattr(sync, "refresh_account", flaky_refresh)
-        nodes = FakeNodes({("nft", "CARDinstances"): [[]]})
-        n = await sync.safety_net_sweep(conn, nodes)
-        assert n == 2
-        assert set(calls) == {"alice", "bob"}
-    finally:
-        await conn.close()
 
 
 async def test_refresh_account_does_not_wipe_holdings_for_a_failed_symbol():
@@ -332,7 +315,76 @@ async def test_refresh_account_dequeues() -> None:
         await conn.close()
 
 
-# -- refresh_worker / safety_net_sweep -------------------------------------------
+async def test_refresh_account_requeues_failed_symbols_with_backoff():
+    """A failed lookup must never be silently dropped: with the safety-net
+    sweep removed, the durable retry row IS the guarantee that the symbol
+    gets re-checked. The retry row carries attempts > 0 and a not_before
+    in the future, so the worker leaves it alone until the window opens."""
+    conn = await fresh_conn("sync_requeue")
+    try:
+        nodes = FakeNodes(
+            {("nft", "CARDinstances"): [[]]},
+            fail={("nft", "STARinstances")},
+        )
+        await sync.refresh_account(conn, nodes, "alice", ["CARD", "STAR"])
+        row = await (await conn.execute(
+            "SELECT symbol, attempts, not_before > now() AS deferred "
+            "FROM refresh_queue WHERE account = 'alice'"
+        )).fetchone()
+        assert row["symbol"] == "STAR"
+        assert row["attempts"] == 1
+        assert row["deferred"] is True
+    finally:
+        await conn.close()
+
+
+async def test_requeue_backoff_grows_with_attempts():
+    conn = await fresh_conn("sync_backoff")
+    try:
+        for _ in range(3):
+            await sync._requeue_failed(conn, "alice", ["STAR"])
+        await conn.commit()
+        row = await (await conn.execute(
+            "SELECT attempts, not_before > now() + interval '3 minutes' AS grew "
+            "FROM refresh_queue WHERE account = 'alice' AND symbol = 'STAR'"
+        )).fetchone()
+        # attempts 1 -> 2 -> 3; third upsert schedules base * 2^2 = 4 min out
+        assert row["attempts"] == 3
+        assert row["grew"] is True
+    finally:
+        await conn.close()
+
+
+# -- refresh_worker ---------------------------------------------------------------
+
+async def test_refresh_worker_skips_rows_still_in_backoff():
+    """A queue row whose not_before window hasn't opened is invisible to
+    the worker -- it must idle rather than hot-loop on a struggling
+    symbol while nodes are down."""
+    conn = await fresh_conn("sync_backoffgate")
+    try:
+        await conn.execute("INSERT INTO collections (symbol) VALUES ('CARD')")
+        await conn.execute(
+            "INSERT INTO refresh_queue (account, symbol, attempts, not_before) "
+            "VALUES ('alice', 'CARD', 1, now() + interval '1 hour')"
+        )
+        await conn.commit()
+        nodes = FakeNodes({("nft", "CARDinstances"): [[]]})
+        stop = asyncio.Event()
+
+        async def stop_soon():
+            await asyncio.sleep(0.3)
+            stop.set()
+
+        await asyncio.gather(sync.refresh_worker(conn, nodes, stop), stop_soon())
+        assert nodes.calls == []  # never touched: row is in backoff
+        row = await (await conn.execute(
+            "SELECT 1 FROM refresh_queue WHERE account = 'alice'"
+        )).fetchone()
+        assert row is not None  # and still queued, not lost
+    finally:
+        await conn.close()
+
 
 async def test_refresh_worker_drains_queue_then_idles():
     conn = await fresh_conn("sync_worker")
@@ -415,16 +467,6 @@ async def test_refresh_worker_caches_known_symbols_across_queued_accounts(monkey
         await conn.close()
 
 
-async def test_safety_net_sweep_retouches_known_accounts():
-    conn = await fresh_conn("sync_safetynet")
-    try:
-        await conn.execute("INSERT INTO known_accounts (account) VALUES ('alice'), ('bob')")
-        await conn.commit()
-        nodes = FakeNodes({})  # empty everywhere -- just verifying it runs over both
-        n = await sync.safety_net_sweep(conn, nodes)
-        assert n == 2
-    finally:
-        await conn.close()
 
 
 # -- market ---------------------------------------------------------------------
@@ -560,5 +602,34 @@ async def test_refresh_market_caps_pagination(monkeypatch):
         nodes = FakeNodes({("nftmarket", "CARDsellBook"): [full_page, full_page, full_page]})
         await sync.refresh_market(conn, nodes, "CARD")
         assert len(nodes.calls) == 2
+    finally:
+        await conn.close()
+
+
+async def test_targeted_refresh_does_not_reset_staleness_clock():
+    """refreshed_at is what the read-staleness bound measures against, so
+    it must mean "last FULL pass". If targeted touches bumped it, an
+    account with frequent activity in one collection would never trip its
+    periodic full re-check while every other symbol drifted."""
+    conn = await fresh_conn("sync_staleclock")
+    try:
+        await conn.execute("INSERT INTO collections (symbol) VALUES ('CARD')")
+        await conn.execute(
+            "INSERT INTO known_accounts (account, refreshed_at) "
+            "VALUES ('alice', now() - interval '2 days')"
+        )
+        await conn.commit()
+        nodes = FakeNodes({("nft", "CARDinstances"): [[], []]})
+        await sync.refresh_account(conn, nodes, "alice", ["CARD"],
+                                   dequeue_symbols=["CARD"])  # targeted
+        row = await (await conn.execute(
+            "SELECT refreshed_at < now() - interval '1 day' AS still_old "
+            "FROM known_accounts WHERE account = 'alice'")).fetchone()
+        assert row["still_old"] is True  # targeted pass left the clock alone
+        await sync.refresh_account(conn, nodes, "alice", ["CARD"])  # full
+        row = await (await conn.execute(
+            "SELECT refreshed_at > now() - interval '1 minute' AS fresh "
+            "FROM known_accounts WHERE account = 'alice'")).fetchone()
+        assert row["fresh"] is True  # full pass resets it
     finally:
         await conn.close()
